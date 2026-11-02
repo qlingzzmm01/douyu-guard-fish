@@ -14,6 +14,20 @@
 - **数据抓包**：所有游戏接口响应落盘 `logs/api_*.jsonl`；每场战报 `logs/battles_*.jsonl`（起始关/结束关/用时/技能选择/回血次数/秒杀次数/血量时间线）
 - **安全红线**：**绝技、加速、技能刷新等一切需要鱼翅（付费）的功能一律不自动点击**；免费用尽后仅使用免费获取的**银币**续打（10 银币/局，余额不足自动停止）
 
+## 防封设计
+
+| 层 | 做法 | 作用 |
+|---|---|---|
+| 驱动 | 用 [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) 替代 playwright（不可用时自动回退） | `navigator.webdriver=false`，抹掉 `Runtime.enable` / CDP 指纹 |
+| UA | headless 下用 CDP `Emulation.setUserAgentOverride` 把 `HeadlessChrome` 换成 `Chrome` | 游戏侧风控 UA 正则显式匹配 `headlesschrome` |
+| 节奏 | 所有等待加 ±25% 抖动；技能/结算前加 0.4~2.2s 人类停顿；场间 12% 概率长休 40~150s | 消除恒定时序特征 |
+| 日上限 | 累计活跃达上限（默认 240 分钟）就长休（默认 90 分钟），跨天重置 | 避免 7×24 挂机特征 |
+| 数据 | 面板/对局数据改从 `page.on("response")` 解析，不再依赖页面内注入的 `window.__WM` | patchright 封了 init script，网络层更稳 |
+| 注入 | 回血/秒杀的守护脚本改由「运行时插入 `<script>`」装进**主世界**，配置与状态走 `localStorage` 双通道 | patchright 的 `evaluate` 在隔离世界，直接注入拿不到游戏引擎 |
+
+> 说明：风控的签名与 `Statis_Interface_Risktoken` 全部由页面 JS 在真实浏览器里生成。
+> 工具只保证**浏览器环境干净 + 行为自然**，不伪造签名、不脱离浏览器发请求，也无法保证一定不被封。
+
 ## 快速开始（免安装）
 
 1. 到 [Releases](../../releases) 下载 `guard-fish-assistant-v*-win64.zip`，解压
@@ -31,7 +45,8 @@
 保卫鱼娘助手.exe --run --rounds 10 --headless   # 后台模式（不显示浏览器）
 保卫鱼娘助手.exe --run --one-hit            # 秒杀模式（卡牌伤害直接击杀）
 保卫鱼娘助手.exe --run --no-hp              # 关闭自动回血
-保卫鱼娘助手.exe --selftest                 # 自检（driver / 浏览器可用性）
+保卫鱼娘助手.exe --run --daily-limit 240 --rest-min 90   # 日活跃上限/长休（分钟，0=不限）
+保卫鱼娘助手.exe --selftest                 # 自检（driver / 浏览器可用性 / webdriver / UA）
 ```
 
 > **关于 CPU 占用**：游戏是 WebGL（PixiJS）画面，程序默认启用硬件加速，战斗中约占 **3~5% 整机 CPU**。

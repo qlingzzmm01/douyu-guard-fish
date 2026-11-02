@@ -95,11 +95,24 @@ class App:
         ttk.Button(top, text="登录斗鱼", width=10, command=self.login).grid(row=0, column=11, padx=(0, 6))
         ttk.Button(top, text="打开数据目录", width=12, command=self.open_dir).grid(row=0, column=12)
 
+        # 防封：日活跃上限（到点长休，避免 7x24 特征）
+        lim = ttk.Frame(top)
+        lim.grid(row=2, column=0, columnspan=13, sticky="w", pady=(8, 0))
+        ttk.Label(lim, text="每日活跃上限", font=FONT).pack(side="left")
+        self.daily_limit = tk.StringVar(value="240")
+        ttk.Entry(lim, textvariable=self.daily_limit, width=5, font=FONT).pack(side="left", padx=(4, 2))
+        ttk.Label(lim, text="分钟，超限休息", font=FONT).pack(side="left")
+        self.rest_min = tk.StringVar(value="90")
+        ttk.Entry(lim, textvariable=self.rest_min, width=4, font=FONT).pack(side="left", padx=(4, 2))
+        ttk.Label(lim, text="分钟（0=不限）", font=FONT).pack(side="left")
+        ttk.Label(lim, text="· 驱动：%s" % botmod.DRIVER_NAME,
+                  font=FONT_S, foreground="#2e7d32").pack(side="left", padx=(14, 0))
+
         tips = ttk.Label(top, text="每日免费挑战 10 次；免费用尽后若银币 ≥10 会自动用银币续打（银币为免费获取；"
                                    "绝技/加速等需鱼翅付费的功能一律不会点击）。"
                                    "中途停止或关闭会导致当前一场作废，建议打完一场再停。",
                          font=FONT_S, foreground="#666")
-        tips.grid(row=2, column=0, columnspan=13, sticky="w", pady=(8, 0))
+        tips.grid(row=3, column=0, columnspan=13, sticky="w", pady=(6, 0))
 
         self.status = tk.StringVar(value="状态：未运行")
         ttk.Label(self.root, textvariable=self.status, anchor="w", padding=(10, 5),
@@ -180,14 +193,20 @@ class App:
             gap_min = float((self.gap_min.get() or "0").strip() or 0)
             gap_max = float((self.gap_max.get() or "0").strip() or 0)
             hp_th = int((self.hp_threshold.get() or "5").strip() or 5)
+            daily_lim = int((self.daily_limit.get() or "240").strip() or 0)
+            rest_min = int((self.rest_min.get() or "90").strip() or 90)
         except ValueError:
-            messagebox.showwarning("输入错误", "房间号/场数/等待时间/回血阈值格式不对")
+            messagebox.showwarning("输入错误", "房间号/场数/等待时间/回血阈值/日上限格式不对")
             return
         if rounds < 0:
             messagebox.showwarning("输入错误", "场数不能为负数（0=不限）")
             return
         if hp_th < 1:
             hp_th = 1
+        if daily_lim < 0:
+            daily_lim = 0
+        if rest_min < 1:
+            rest_min = 1
         if gap_max < gap_min:
             gap_min, gap_max = gap_max, gap_min
             self.gap_min.set("%g" % gap_min)
@@ -205,20 +224,23 @@ class App:
         self._log("[系统] 银币续打：%s" % ("开（免费用尽后银币≥10 自动继续）" if self.coin_var.get() else "关"))
         if self.one_hit_var.get():
             self._log("[系统] 秒杀模式：开（我方卡牌造成的任何伤害直接击杀怪物）")
+        self._log("[系统] 日活跃上限：%s" % (("%d 分钟，超限休息 %d 分钟" % (daily_lim, rest_min))
+                                            if daily_lim > 0 else "不限"))
         self.thread = threading.Thread(target=self._run,
                                        args=(rid, rounds, gap_min, gap_max, self.headless_var.get(),
                                              self.hp_var.get(), hp_th, self.coin_var.get(),
-                                             self.one_hit_var.get()),
+                                             self.one_hit_var.get(), daily_lim, rest_min),
                                        daemon=True)
         self.thread.start()
 
     def _run(self, rid, rounds, gap_min, gap_max, headless, hp_guard, hp_th, coin_play,
-             one_hit=False):
+             one_hit=False, daily_lim=240, rest_min=90):
         try:
             self.bot = botmod.GuardFishBot(rid=rid, rounds=rounds, gap_min=gap_min,
                                            gap_max=gap_max, headless=headless,
                                            hp_guard=hp_guard, hp_threshold=hp_th,
-                                           coin_play=coin_play, one_hit=one_hit)
+                                           coin_play=coin_play, one_hit=one_hit,
+                                           daily_limit_min=daily_lim, rest_min=rest_min)
             self.bot.add_log_sink(lambda line, level=None: LOG_Q.put((line, level)))
             self.bot.start()
             self.bot._thread.join()
@@ -238,16 +260,27 @@ class App:
         if self.running:
             messagebox.showinfo("提示", "挂机运行中，请先停止再登录")
             return
-        self._log("[系统] 正在打开登录窗口（登录完成后直接关掉浏览器窗口即可）…")
+        self._log("[系统] 正在打开登录窗口（扫码后等提示「登录成功」再关窗口）…")
 
         def run():
-            msg, tag = None, "dim"
+            ok = False
             try:
-                botmod.open_login(self.rid.get() or botmod.DEFAULT_RID)
-                msg = "[系统] 登录窗口已关闭。"
+                ok = bool(botmod.open_login(self.rid.get() or botmod.DEFAULT_RID))
             except Exception as e:
-                msg, tag = "[异常] 登录失败：%s" % e, "error"
-            self.root.after(0, lambda m=msg, t=tag: self._log(m, t))
+                self.root.after(0, lambda: self._log("[异常] 登录失败：%s" % e, "error"))
+                return
+            if ok:
+                self.root.after(0, lambda: self._log("[系统] 登录成功，可以开始挂机了。"))
+            else:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "登录未完成",
+                    "没有检测到登录成功。\n\n"
+                    "常见原因：\n"
+                    "1. 扫码后没等页面跳转就关了窗口\n"
+                    "2. 同一账号在别处重新登录，把这里的会话挤掉了\n\n"
+                    "请重新点「登录斗鱼」，扫码后等到提示「登录成功」再关窗口。"))
+                self.root.after(0, lambda: self._log(
+                    "[系统] 登录未完成，请重试（详见提示框）。", "warn"))
         threading.Thread(target=run, daemon=True).start()
 
     def open_dir(self):

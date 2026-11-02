@@ -1,13 +1,31 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""保卫鱼娘挂机助手 · PyInstaller 打包配置（单文件 exe，含 Playwright driver）"""
+"""保卫鱼娘挂机助手 · PyInstaller 打包配置（单文件 exe，含 patchright driver）
+
+防封改造说明：
+  - 主驱动 patchright（Playwright 反检测分支），因此打包 patchright 自带的 driver。
+  - playwright 仍保留 hiddenimports 作为源码环境的降级路径；但**不再打包它的 driver**
+    （两个 driver 各约 100MB，双份会让 exe 翻倍）。打包版永远走 patchright。
+"""
 import os
-import playwright
 
-PW_DIR = os.path.dirname(playwright.__file__)
-DRIVER = os.path.join(PW_DIR, "driver")          # node.exe + package/cli.js（约 100MB）
+# ---- patchright driver（node.exe + package/cli.js，约 100MB）----
+try:
+    import patchright
+    PR_DIR = os.path.dirname(patchright.__file__)
+except Exception:
+    raise SystemExit("打包需要先 pip install patchright")
 
-datas = [(DRIVER, os.path.join("playwright", "driver"))]
-hiddenimports = ["playwright", "playwright.sync_api", "playwright.async_api", "greenlet"]
+PR_DRIVER = os.path.join(PR_DIR, "driver")
+if not os.path.isdir(PR_DRIVER):
+    raise SystemExit("未找到 patchright driver：%s（试试 pip install --force-reinstall patchright）" % PR_DRIVER)
+
+datas = [(PR_DRIVER, os.path.join("patchright", "driver"))]
+hiddenimports = [
+    "patchright", "patchright.sync_api", "patchright.async_api",
+    # 降级路径（源码环境有效；打包版缺 driver，仅供 import 不报错）
+    "playwright", "playwright.sync_api", "playwright.async_api",
+    "greenlet",
+]
 
 a = Analysis(
     ["yu_gui.py"],

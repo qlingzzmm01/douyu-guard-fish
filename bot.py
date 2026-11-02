@@ -31,8 +31,41 @@ DEFAULT_RID = "12306"
 GAME_URL = "https://www.douyu.com/pages/vibe-lab-act202606-game/mine?rid={rid}&isAnchorSide=0"
 HOME_URL = "https://www.douyu.com/"
 
+# ---------------------------------------------------------------- 防封基础工具
+# 驱动：优先 patchright（Playwright 反检测分支，API 完全兼容），不可用时降级 playwright。
+# 为什么：原版 Playwright 启动时会开 Runtime.enable 并让 navigator.webdriver=true，
+#         页面（含游戏风控 SDK）可直接读到；patchright 在驱动层抹掉这些特征。
+def pick_driver():
+    """返回 (驱动名, sync_playwright 可调用对象)"""
+    try:
+        from patchright.sync_api import sync_playwright as _sp
+        return "patchright", _sp
+    except Exception:
+        from playwright.sync_api import sync_playwright as _sp
+        return "playwright", _sp
+
+
+DRIVER_NAME, sync_playwright = pick_driver()
+
+
+def usleep(sec, ratio=0.25, lo=0.05):
+    """带抖动的等待。阈值 lo 很重要：低于 50ms 的等待不动，避免破坏库内部时序。"""
+    try:
+        v = float(sec)
+    except Exception:
+        return
+    if v <= 0:
+        return
+    time.sleep(max(lo, v + random.uniform(-ratio, ratio) * v))
+
+
+def jitter(sec, lo=0.0, hi=0.0):
+    """在 [lo, hi] 基础上抖动；用于轮询间隔"""
+    return max(0.05, sec + random.uniform(lo, hi))
+
+
 MAX_BATTLE_SECONDS = 13 * 60      # 单场最长等待（服务端上限 600s + 余量）
-TICK = 0.5                         # 状态轮询间隔
+TICK = 0.5                         # 状态轮询间隔（实际用 jitter 抖动）
 IDLE_STUCK_LIMIT = 90              # 空闲态卡住多久后尝试恢复（刷新页面）
 PRE_BATTLE_LIMIT = 90              # 点挑战后"无进展"超时（每有进展会重新计时）
 PRE_BATTLE_HARD_LIMIT = 300        # 点挑战后绝对上限（防止面板反复刷而无限等）
@@ -212,11 +245,56 @@ CHROME_ARGS = [
 VIEWPORT = {"width": 1500, "height": 940}
 
 
+def fix_headless_ua(ctx, headless):
+    """headless 模式下把 UA 里的 HeadlessChrome 换成 Chrome。
+
+    为什么：游戏侧风控 SDK 的 UA 正则显式匹配 `headlesschrome`，这是 headless 最致命的暴露点。
+    为什么用 CDP：patchright 出于反检测目的封死了 add_init_script 与
+      Page.addScriptToEvaluateOnNewDocument，只有 Emulation.setUserAgentOverride 可用，
+      且它同时作用于 JS 层（navigator.userAgent）与 HTTP 请求头层。
+    返回 (原始UA, 修正后UA 或 None, 错误信息或 None)
+    """
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        ua = page.evaluate("() => navigator.userAgent") or ""
+    except Exception as e:
+        return None, None, "读取 UA 失败：%s" % str(e)[:100]
+    if "HeadlessChrome" not in ua:
+        return ua, ua, None
+    fixed = ua.replace("HeadlessChrome", "Chrome")
+    m = re.search(r"Chrome/(\d+)", fixed)
+    major = m.group(1) if m else "140"
+    try:
+        cdp = ctx.new_cdp_session(page)
+        cdp.send("Emulation.setUserAgentOverride", {
+            "userAgent": fixed,
+            "userAgentMetadata": {
+                "brands": [
+                    {"brand": "Not A;Brand", "version": "24"},
+                    {"brand": "Chromium", "version": major},
+                    {"brand": "Google Chrome", "version": major},
+                ],
+                "fullVersion": "%s.0.0.0" % major,
+                "mobile": False,
+                "platform": "Windows",
+                "platformVersion": "15.0.0",
+                "architecture": "x86",
+                "bitness": "64",
+                "model": "",
+                "wow64": False,
+            },
+        })
+        return ua, fixed, None
+    except Exception as e:
+        return ua, None, "setUserAgentOverride 失败：%s" % str(e)[:120]
+
+
 def launch_persistent(pw, user_data_dir, headless=False):
     """逐候选启动持久化 Chrome；每个候选重试 2 次。返回 (ctx, used_path)
 
     GPU 回退：第一轮用硬件加速参数（CHROME_ARGS，不含 --disable-gpu）；
     若所有候选都起不来，再加 --disable-gpu 重试一轮，兼容无显卡/驱动异常的环境。
+    headless 下额外用 CDP 修正 UA（见 fix_headless_ua）。
     """
     cands = chrome_candidates()
     if not cands:
@@ -247,6 +325,13 @@ def launch_persistent(pw, user_data_dir, headless=False):
                         except Exception:
                             pass
                         raise RuntimeError("context 启动后不可用（可能被已有浏览器实例接管）")
+                    # headless：UA 去 HeadlessChrome（覆盖 selftest / open_login / 挂机全部路径）
+                    if headless:
+                        ua_raw, ua_new, ua_err = fix_headless_ua(ctx, headless)
+                        if ua_err:
+                            log_msg("[防封] UA 修正失败：%s" % ua_err)
+                        elif ua_new and ua_raw != ua_new:
+                            log_msg("[防封] UA 已修正：HeadlessChrome → Chrome")
                     return ctx, exe
                 except Exception as e:
                     errs.append("%s(%s) 第%d次: %s" % (name, os.path.basename(exe), attempt, str(e)[:120]))
@@ -332,11 +417,22 @@ JS_HP_WATCH = r"""
       const starts = [];
       for (const id of Object.keys(roots)) { const fr = roots[id]; if (fr && fr.current) starts.push(fr.current); }
       if (!starts.length) {
-        const el = document.querySelector('[class*="GameHUD-module_container"], [class*="CardLanes"], canvas');
-        if (el) {
-          const k = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
-          if (k) { let f = el[k]; while (f && f.return) f = f.return; if (f) starts.push(f); }
+        // DOM 兜底：DevTools hook 在 patchright 下装不进 document-start，拿不到 roots，
+        // 只能从元素上的 __reactFiber$ 反向回溯到根。
+        const FK = ['__reactFiber$', '__reactInternalInstance$'];
+        const keyOf = el => { try { return Object.keys(el).find(k => FK.some(p => k.startsWith(p))) || null; } catch (e) { return null; } };
+        let el = document.querySelector('[class*="GameHUD-module_container"], [class*="CardLanes"], canvas');
+        let k = el ? keyOf(el) : null;
+        if (!k) {
+          // 全页扫第一个带 fiber 的元素（主世界才看得到这个 expando）
+          try {
+            for (const e of document.querySelectorAll('*')) {
+              const kk = keyOf(e);
+              if (kk) { el = e; k = kk; break; }
+            }
+          } catch (e) {}
         }
+        if (el && k) { let f = el[k]; while (f && f.return) f = f.return; if (f) starts.push(f); }
       }
       let best = null, bestScore = 0, bestName = '', bestKind = '';
       const seen = new Set();
@@ -417,6 +513,45 @@ JS_HP_WATCH = r"""
   let lastScan = 0;
   setInterval(() => {
     try {
+      // 配置从 localStorage 读（跨 JS 世界共享）：patchright 的 evaluate 在隔离世界，
+      // 直接改 window.__GF 对主世界无效，因此必须走这条通道。
+      try {
+        const raw = localStorage.getItem('gf_cfg');
+        if (raw) {
+          const c = JSON.parse(raw);
+          GF.hpGuard = !!c.hpGuard;
+          GF.oneHit = !!c.oneHit;
+          GF.threshold = Number(c.threshold) || 5;
+          GF.enabled = !!(GF.hpGuard || GF.oneHit);
+        }
+      } catch (e) {}
+      // 一次性命令通道（开局打点 / 清零计数）
+      try {
+        const cmd = localStorage.getItem('gf_cmd');
+        if (cmd) {
+          localStorage.removeItem('gf_cmd');
+          const c = JSON.parse(cmd);
+          if (c.battleT0) { GF.battleT0 = c.battleT0; GF.capped = false; }
+          if (c.resetKills) { GF.oneHitKills = 0; }
+        }
+      } catch (e) {}
+      // 状态回传给 Python（同样走 localStorage）
+      try {
+        if (!GF._pubT || Date.now() - GF._pubT > 400) {
+          GF._pubT = Date.now();
+          if (GF.hpEvents.length > 400) GF.hpEvents.splice(0, GF.hpEvents.length - 400);
+          const base = Math.max(0, GF.hpEvents.length - 200);
+          localStorage.setItem('gf_status', JSON.stringify({
+            refills: GF.refills || 0, wrapped: !!GF.wrapped, found: !!GF.mgrRef,
+            comp: GF.comp || '', hp: GF.hp,
+            oneHit: !!GF.oneHit, oneHitWrapped: !!GF.oneHitWrapped,
+            oneHitKills: GF.oneHitKills || 0,
+            scanCount: GF.scanCount || 0, scanInfo: GF.scanInfo, err: GF.err,
+            evTotal: GF.hpEvents.length, evBase: base,
+            events: GF.hpEvents.slice(base)
+          }));
+        }
+      } catch (e) {}
       if (!GF.enabled) return;
       let cur = GF.mgrRef && GF.mgrRef.current;
       let t = resolveTarget(cur);
@@ -508,6 +643,55 @@ JS_HP_DRAIN = r"""
 }
 """
 
+# 主世界代理注入器：patchright 的 evaluate 跑在隔离世界，无法直接装主世界的 hook，
+# 而内联脚本（运行时插入）可以执行。所以用「插一个 <script> 标签」把 JS_HP_WATCH
+# 装进主世界，之后配置/状态通过 localStorage 双向传递（localStorage 跨世界共享）。
+JS_GF_BOOT = r"""
+(agentSrc) => {
+  if (window.__GF) return 'exists';
+  try {
+    const s = document.createElement('script');
+    s.textContent = agentSrc;
+    (document.head || document.documentElement).appendChild(s);
+    s.remove();
+    return window.__GF ? 'injected' : 'tried';
+  } catch (e) {
+    return 'err:' + String(e).slice(0, 80);
+  }
+}
+"""
+
+# 从主世界代理读状态（localStorage 共享）
+JS_GF_STATUS = r"""
+() => {
+  try {
+    const raw = localStorage.getItem('gf_status');
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) { return null; }
+}
+"""
+
+# 写配置到主世界代理
+JS_GF_CFG = r"""
+(cfg) => {
+  try {
+    localStorage.setItem('gf_cfg', JSON.stringify(cfg));
+    return cfg;
+  } catch (e) { return null; }
+}
+"""
+
+# 一次性命令（开局时间打点 / 清零秒杀计数）
+JS_GF_CMD = r"""
+(cmd) => {
+  try {
+    localStorage.setItem('gf_cmd', JSON.stringify(cmd));
+    return true;
+  } catch (e) { return false; }
+}
+"""
+
 JS_HOOK = r"""
 (() => {
   if (window.__WM) return;
@@ -592,7 +776,17 @@ JS_STATE = r"""
 
   const cb = q('[class*="challengeButton"]');
   out.canChallenge = vis(cb);
-  if (vis(cb)) out.challengeTxt = (cb.innerText || '').replace(/\n/g, ' ').trim().slice(0, 60);
+  if (vis(cb)) {
+    out.challengeTxt = (cb.innerText || '').replace(/\n/g, ' ').trim().slice(0, 60);
+    // 按钮可能在长页面底部，视口外时 JS click() 不生效（真实 bug，见需求文档第五节）
+    try {
+      const r = cb.getBoundingClientRect();
+      const cy = r.top + r.height / 2;
+      out.challengeOffscreen = (cy > window.innerHeight || cy < 0);
+      out.challengeRect = {x: r.left + r.width / 2 + window.scrollX,
+                           y: r.top + r.height / 2 + window.scrollY};
+    } catch (e) { out.challengeOffscreen = false; }
+  }
 
   // 每周宝箱「领取」（战斗宝箱领取按钮：固定 id js-target-treasure）
   if (out.inBattle) {
@@ -811,7 +1005,8 @@ def score_skill_text(txt):
 class GuardFishBot:
     def __init__(self, rid=DEFAULT_RID, rounds=10, gap_min=5, gap_max=15,
                  headless=False, claim_weekpass=True, on_log=None,
-                 hp_guard=True, hp_threshold=5, coin_play=True, one_hit=False):
+                 hp_guard=True, hp_threshold=5, coin_play=True, one_hit=False,
+                 daily_limit_min=240, rest_min=90):
         self.rid = str(rid)
         self.rounds = int(rounds)
         self.gap_min = float(gap_min or 0)
@@ -823,6 +1018,8 @@ class GuardFishBot:
         self.coin_play = bool(coin_play)          # 免费用尽后用银币续打（银币为免费获取）
         self.one_hit = bool(one_hit)              # 秒杀模式：我方卡牌造成的伤害直接击杀
         self._one_hit_kills = 0
+        self.daily_limit_min = int(daily_limit_min or 0)   # 日活跃上限（分钟，0=不限）
+        self.rest_min = int(rest_min or 90)                # 达到上限后长休（分钟）
         self._battle_paid = "free"                # free / coin
 
         self._stop = threading.Event()
@@ -841,6 +1038,17 @@ class GuardFishBot:
         self._server_reject_ts = 0
         self._report_errs = 0
         self._date = datetime.date.today().strftime("%Y%m%d")
+
+        # 网络层数据缓存（patchright 封了 init script，__WM 不可用时靠它）
+        self._net = {"nick": None, "freeNum": None, "coin": None, "weekRank": None,
+                     "maxStage": 0, "stage": None, "notLogin": False,
+                     "panelTs": 0, "battleTs": 0, "panelEver": False}
+        self._login_code = None
+        self._gf_ev_idx = 0          # 已处理的主世界事件序号（localStorage 通道去重）
+        # 日活跃计时（防 7x24 特征）：累计活跃秒数，跨天重置
+        self._active_sec = 0.0
+        self._active_mark = 0.0
+        self._active_date = self._date
 
         # 对外可见的状态（GUI 读取）
         self.status = {
@@ -876,51 +1084,82 @@ class GuardFishBot:
     def _ensure_browser(self):
         if self._ctx is not None and self._page is not None:
             try:
-                self._page.evaluate("1")
+                self._eval("1")
                 return
             except Exception:
                 self._close_browser()
-        from playwright.sync_api import sync_playwright
         if self._pw is None:
             self._pw = sync_playwright().start()
+            self._log("驱动：%s" % DRIVER_NAME)
         kill_stale_chrome(PROFILE)
         clean_profile_locks(PROFILE)
         ctx, exe = launch_persistent(self._pw, PROFILE, headless=self.headless)
         self._ctx = ctx
         self._page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        self._log("浏览器就绪：%s" % exe)
+        self._log("浏览器就绪：%s（驱动：%s）" % (exe, DRIVER_NAME))
+        # patchright 封死了 add_init_script / addScriptToEvaluateOnNewDocument，
+        # 因此注入改为「每次导航后 evaluate 注入」，见 _inject_page_scripts。
+        # playwright 降级路径下 init script 仍然可用，两者都保留更稳。
         try:
             ctx.add_init_script(FAKE_DEVTOOLS_HOOK)
             ctx.add_init_script(JS_HP_WATCH)
-        except Exception as e:
-            self._log("注入回血脚本失败：%s" % str(e)[:120], "warn")
-        try:
             self._page.add_init_script(JS_HOOK)
-        except Exception as e:
-            self._log("注入 hook 失败：%s" % str(e)[:120], "warn")
+        except Exception:
+            pass
         try:
             self._page.on("response", self._on_response)
         except Exception:
             pass
         # 关闭付费「不再提示」标记（安全兜底）
         try:
-            cleared = self._page.evaluate(JS_CLEAR_NO_TIP)
+            cleared = self._eval(JS_CLEAR_NO_TIP)
             if cleared:
                 self._log("已清理付费免提示标记：%s" % cleared, "warn")
         except Exception:
             pass
 
-    def _apply_hp_config(self):
-        """把回血/秒杀配置同步到页面"""
+    def _inject_page_scripts(self):
+        """导航后把「主世界代理」装进页面。
+
+        为什么这么绕：patchright 封死了 add_init_script / addScriptToEvaluateOnNewDocument，
+        而它的 page.evaluate 默认跑在**隔离世界**——在隔离世界里看不到页面的
+        window.__reactFiber$、看不到页面 fetch、也拿不到游戏引擎实例。
+        实测：运行时插入 <script> 标签可以执行（走主世界），所以用 JS_GF_BOOT
+        把 JS_HP_WATCH 装进主世界；配置与状态用 localStorage 双向传（跨世界共享）。
+        """
+        ok = []
         try:
-            r = self._page.evaluate(JS_HP_CFG, {"hpGuard": self.hp_guard,
-                                                "threshold": self.hp_threshold,
-                                                "oneHit": self.one_hit})
-            if r:
-                self._log("回血守护：%s（阈值 < %s 回满）｜秒杀模式：%s"
-                          % ("开" if r.get("hpGuard") else "关", r.get("threshold"),
-                             "开" if r.get("oneHit") else "关"))
-            return r
+            r = self._eval(JS_GF_BOOT, JS_HP_WATCH)
+            ok.append("agent:%s" % r)
+        except Exception as e:
+            self._log("注入主世界代理失败：%s" % str(e)[:120], "warn")
+        try:
+            self._eval(JS_HOOK)
+            ok.append("wm-hook")
+        except Exception:
+            pass
+        self._apply_hp_config()
+        return ok
+
+    def _apply_hp_config(self):
+        """把回血/秒杀配置写入 localStorage（主世界代理每 250ms 读一次）"""
+        cfg = {"hpGuard": bool(self.hp_guard),
+               "threshold": int(self.hp_threshold),
+               "oneHit": bool(self.one_hit)}
+        try:
+            self._eval(JS_GF_CFG, cfg)
+            self._log("回血守护：%s（阈值 < %s 回满）｜秒杀模式：%s"
+                      % ("开" if cfg["hpGuard"] else "关", cfg["threshold"],
+                         "开" if cfg["oneHit"] else "关"))
+            return cfg
+        except Exception as e:
+            self._log("下发回血/秒杀配置失败：%s" % str(e)[:100], "warn")
+            return None
+
+    def _gf_status(self):
+        """读主世界代理发布的状态（localStorage 通道）"""
+        try:
+            return self._eval(JS_GF_STATUS)
         except Exception:
             return None
 
@@ -960,6 +1199,8 @@ class GuardFishBot:
             if body:
                 try:
                     j = json.loads(body)
+                    # ==== 网络层数据缓存（patchright 下 __WM 不可用，这里是主通道）====
+                    self._net_update(api, j)
                     # 战斗统计：宝箱领取累计
                     if api == "game/receiveBox" and isinstance(j, dict):
                         d = j.get("data") or {}
@@ -999,6 +1240,64 @@ class GuardFishBot:
         except Exception:
             pass
 
+    # -------- 网络层数据缓存（patchright 下 __WM 注入不可用，这里是主通道）--------
+    def _net_update(self, api, j):
+        """从接口响应里抽取面板/对局数据。失败静默，不能影响抓包主流程。"""
+        try:
+            if not isinstance(j, dict):
+                return
+            d = j.get("data") or {}
+            now = time.time()
+            # 通用兜底：几乎所有 actgame 响应都带 userInfo / siteUserInfo，
+            # 这样 battleStart / stageEnd 等接口也能刷新 freeNum（否则会用到过期值）
+            try:
+                u0 = d.get("userInfo") or {}
+                s0 = d.get("siteUserInfo") or {}
+                if u0.get("freeNum") is not None:
+                    self._net["freeNum"] = u0.get("freeNum")
+                if u0.get("maxStage") is not None:
+                    self._net["maxStage"] = u0.get("maxStage")
+                if s0.get("coin") is not None:
+                    self._net["coin"] = s0.get("coin")
+                if s0.get("siteWeekRank") is not None:
+                    self._net["weekRank"] = s0.get("siteWeekRank")
+            except Exception:
+                pass
+            if api == "basics/panelInfo":
+                self._login_code = j.get("code") if j.get("code") is not None else self._login_code
+                self._net["notLogin"] = (j.get("code") == 1002)
+                u = d.get("userInfo") or {}
+                s = d.get("siteUserInfo") or {}
+                if u.get("nn"):
+                    self._net["nick"] = u.get("nn")
+                if s.get("siteWeekRank") is not None:
+                    self._net["weekRank"] = s.get("siteWeekRank")
+                self._net["panelTs"] = now
+                if j.get("code") in (0, None):
+                    self._net["panelEver"] = True
+            elif api == "game/battleInfo":
+                b = d.get("battleInfo") or {}
+                if b.get("curStage") is not None:
+                    self._net["stage"] = {"curStage": b.get("curStage"),
+                                          "curHp": b.get("baseHp")}
+                self._net["battleTs"] = now
+            elif api in ("game/stageStart", "game/stageEnd", "game/nextStage", "game/battleStart"):
+                si = d.get("stageInfo") or {}
+                b = d.get("battleInfo") or {}
+                if si.get("curStage") is not None:
+                    self._net["stage"] = {"curStage": si.get("curStage"),
+                                          "curHp": si.get("baseHp")}
+                elif b.get("curStage") is not None:
+                    self._net["stage"] = {"curStage": b.get("curStage"),
+                                          "curHp": b.get("baseHp")}
+        except Exception:
+            pass
+
+    def _net_fresh(self, kind="panel", ttl=120):
+        """网络缓存是否新鲜（默认 2 分钟内）"""
+        ts = self._net.get("panelTs" if kind == "panel" else "battleTs") or 0
+        return (time.time() - ts) <= ttl
+
     def _api_write(self, obj):
         try:
             if self._api_fp is None:
@@ -1022,9 +1321,42 @@ class GuardFishBot:
             pass
 
     # -------- 页面动作 --------
+    def _merge_net(self, st):
+        """把网络回调缓存合并进状态（patchright 下 __WM 为空，这是主数据源）。
+
+        原则：页面/__WM 有值优先（实时性更好），缺失时用网络缓存补齐；
+              panelReady 用「页面 or 网络最近 2 分钟收到过 panelInfo」。
+        """
+        if not st:
+            return st
+        try:
+            wm = st.get("wm")
+            if not isinstance(wm, dict):
+                wm = {}
+            net = self._net
+            if net.get("nick") and not wm.get("nick"):
+                wm["nick"] = net["nick"]
+            if wm.get("freeNum") is None and net.get("freeNum") is not None:
+                wm["freeNum"] = net["freeNum"]
+            if wm.get("coin") is None and net.get("coin") is not None:
+                wm["coin"] = net["coin"]
+            if not wm.get("weekRank") and net.get("weekRank"):
+                wm["weekRank"] = net["weekRank"]
+            if not wm.get("maxStage") and net.get("maxStage"):
+                wm["maxStage"] = net["maxStage"]
+            if not wm.get("stage") and net.get("stage"):
+                wm["stage"] = net["stage"]
+            if not wm.get("panelReady") and self._net_fresh("panel", 180):
+                wm["panelReady"] = True
+            st["wm"] = wm
+        except Exception:
+            pass
+        return st
+
     def _state(self):
         try:
-            return self._page.evaluate(JS_STATE)
+            st = self._eval(JS_STATE)
+            return self._merge_net(st)
         except Exception as e:
             self._log("状态读取失败：%s" % str(e)[:120], "warn")
             return None
@@ -1072,6 +1404,74 @@ class GuardFishBot:
             pass
         return None
 
+    # -------- 可信点击（防封：走浏览器输入管线，isTrusted=true）--------
+    def _scroll_to_challenge(self, st=None):
+        """若「开启挑战」按钮在视口外，用真实滚轮滚过去。
+
+        为什么：按钮在长页面底部（实测 y≈1758，视口 940），JS 的 element.click()
+        对视口外元素不生效——rect 有尺寸、canChallenge=True、点击无报错，但游戏收不到。
+        滚动容器是 [class*="rc-scrollbars-view"]，用 page.mouse.wheel 更接近真人。
+        """
+        try:
+            st = st or self._state() or {}
+            if not st.get("challengeOffscreen"):
+                return True
+            for _ in range(6):
+                # 鼠标先移到页面中部（滚动容器上）
+                self._page.mouse.move(random.randint(700, 800), random.randint(430, 520))
+                time.sleep(random.uniform(0.06, 0.18))
+                self._page.mouse.wheel(0, random.randint(420, 680))
+                time.sleep(random.uniform(0.25, 0.5))
+                st2 = self._state() or {}
+                if st2.get("canChallenge") and not st2.get("challengeOffscreen"):
+                    return True
+            return not (self._state() or {}).get("challengeOffscreen")
+        except Exception as e:
+            self._log("滚动到挑战按钮失败：%s" % str(e)[:100], "warn")
+            return False
+
+    def _trusted_click(self, selector, label=""):
+        """真实鼠标点击元素中心（isTrusted=true）。找不到/不可见时返回 False。"""
+        try:
+            box = self._eval(
+                """(sel) => { const b = document.querySelector(sel); if (!b) return null;
+                     const r = b.getBoundingClientRect();
+                     if (r.width < 1 || r.height < 1) return null;
+                     const cy = r.top + r.height / 2;
+                     return {x: r.left + r.width / 2, y: cy,
+                             off: (cy > window.innerHeight || cy < 0)}; }""", selector)
+            if not box or box.get("off"):
+                return False
+            x = box["x"] + random.uniform(-2.5, 2.5)
+            y = box["y"] + random.uniform(-2.0, 2.0)
+            self._page.mouse.move(x, y)
+            time.sleep(random.uniform(0.08, 0.25))
+            self._page.mouse.down()
+            time.sleep(random.uniform(0.03, 0.09))
+            self._page.mouse.up()
+            if label:
+                self._log("鼠标点击：%s" % label)
+            return True
+        except Exception as e:
+            if label:
+                self._log("鼠标点击 %s 失败：%s" % (label, str(e)[:100]), "warn")
+            return False
+
+    def _click_challenge(self, st=None):
+        """点「开启挑战」：优先可信鼠标点击（必要时先滚动），失败再退回 JS click。"""
+        st = st or self._state() or {}
+        if st.get("challengeOffscreen"):
+            self._scroll_to_challenge(st)
+        if self._trusted_click('[class*="challengeButton"]', "开启挑战"):
+            try:
+                txt = self._eval(
+                    "() => { const b = document.querySelector('[class*=\"challengeButton\"]');"
+                    " return b ? (b.innerText||'').replace(/\\n/g,' ').trim() : null; }")
+            except Exception:
+                txt = None
+            return txt or "clicked"
+        return self._click(JS_CLICK_CHALLENGE)
+
     def _gate_challenge(self, st, wait_s=25):
         """开局闸门：免费 → 直接开；免费用尽 → 银币够则开（银币免费获取），否则停止。
         内部等待页面数据就绪（防止刷新后误判资源）。
@@ -1086,7 +1486,7 @@ class GuardFishBot:
                 break
             if self._stop.is_set() or (time.time() - t0) > wait_s:
                 return False, "等待游戏数据加载超时（页面未就绪），停止"
-            time.sleep(1.0)
+            usleep(1.0)
             st2 = self._state()
             if st2:
                 st = st2
@@ -1126,14 +1526,14 @@ class GuardFishBot:
         if not ok:
             self._log(why + "。", "warn")
             return False, info
-        r = self._click(JS_CLICK_CHALLENGE)
+        r = self._click_challenge(st)
         self._log("已点击「开启挑战」（%s%s）"
                   % (why, "，本场消耗银币" if self._battle_paid == "coin" else ""))
         if not r:
             return False, info
         # 标记本场开始时间（回血守护据此在 9 分钟时收手，避免撞服务端 600 秒上限）
         try:
-            self._page.evaluate("() => { if (window.__GF) { window.__GF.battleT0 = Date.now(); window.__GF.capped = false; window.__GF.oneHitKills = 0; } }")
+            self._eval(JS_GF_CMD, {"battleT0": int(time.time() * 1000), "resetKills": True})
         except Exception:
             pass
         last_click = time.time()
@@ -1160,17 +1560,23 @@ class GuardFishBot:
                 else:
                     self._log("开局超时：%ds 内无任何进展" % PRE_BATTLE_LIMIT, "warn")
                 break
-            time.sleep(0.8)
+            time.sleep(jitter(0.8, -0.15, 0.35))
             st = self._state()
             if not st:
                 continue
             self._sync_status(st)
 
+            # 服务端已明确拒绝本场（如 1042008「游戏状态异常」）：
+            # 继续点「开启挑战」只会重复扣银币且不会成功，直接放弃本次尝试。
+            if self._server_reject_ts and (time.time() - self._server_reject_ts) < 120:
+                self._log("服务端拒绝开局（状态异常），本场放弃，避免重复扣银币", "warn")
+                return False, info
+
             if st.get("limitAlter"):
                 self._click(JS_CLOSE_LIMIT_ALTER)
                 self._log("卡组不足提示：需要 9 张出战卡（请到编队里配满）", "warn")
                 last_progress = time.time()
-                time.sleep(1)
+                usleep(1.0)
                 continue
 
             cards = st.get("skillPanel")
@@ -1179,11 +1585,13 @@ class GuardFishBot:
                 scores = [score_skill_text(t) for t in texts]
                 best = scores.index(max(scores))
                 self._log("前置技能三选一 → 选 #%d（%d分）：%s" % (best + 1, max(scores), texts[best][:70]))
+                # 人类行为：先停顿一下再点（模拟阅读技能描述）
+                time.sleep(random.uniform(0.4, 1.4))
                 got = self._click(JS_CLICK_SKILL, best)
                 if got:
                     info["skills"].append({"text": texts[best][:80], "score": max(scores)})
                 last_progress = time.time()
-                time.sleep(2.0)
+                usleep(2.0)
                 continue
 
             if st.get("finalSkillList"):
@@ -1195,6 +1603,8 @@ class GuardFishBot:
                 # 点击「开始战斗」：带冷却，避免每 0.8s 狂点；并校验返回结果
                 if time.time() - last_final_click > 3.0:
                     last_final_click = time.time()
+                    # 人类行为：犹豫一下再点
+                    time.sleep(random.uniform(0.6, 1.8))
                     r = self._click(JS_CLICK_FINAL_START)
                     if isinstance(r, dict):
                         if r.get("ok"):
@@ -1209,7 +1619,7 @@ class GuardFishBot:
                     else:
                         final_fail_why = "no-skillList"
                         self._log("技能确认列表未能开始：页面未找到 Starter-module_skillList", "warn")
-                time.sleep(1.0)
+                usleep(1.0)
                 continue
 
             if st.get("inBattle"):
@@ -1217,12 +1627,12 @@ class GuardFishBot:
             if st.get("result") or st.get("treasure"):
                 self._log("战斗未开始即出现结算？", "warn")
                 self._click(JS_RESULT_BTN)
-                time.sleep(1.5)
+                usleep(1.5)
                 continue
 
             # 仍停在主页面：点击可能落空（按钮未就绪/被拦截）→ 重试
             if st.get("canChallenge") and (time.time() - last_click) > 15 and clicks < 6:
-                r2 = self._click(JS_CLICK_CHALLENGE)
+                r2 = self._click_challenge(st)
                 if r2:
                     clicks += 1
                     last_click = time.time()
@@ -1237,71 +1647,117 @@ class GuardFishBot:
             self._page.goto(GAME_URL.format(rid=self.rid), wait_until="domcontentloaded", timeout=90000)
         except Exception as e:
             self._log("页面加载异常：%s" % str(e)[:150], "warn")
-        # 兜底：确保 hook 存在（add_init_script 通常已注入）
-        try:
-            has = self._page.evaluate("() => !!window.__WM")
-            if not has:
-                self._page.evaluate(JS_HOOK)
-            hasgf = self._page.evaluate("() => !!window.__GF")
-            if not hasgf:
-                self._page.evaluate(JS_HP_WATCH)
-        except Exception:
-            pass
-        self._apply_hp_config()
+        # patchright 下 init script 无效，加载后补注入
+        self._inject_page_scripts()
+        # 登录判定：网络缓存优先，__WM hook 兜底
         self._wait_ready(60)
-        # 等 panelInfo 真正返回后再判断登录态
+        ok = self._wait_login(45)
+        if ok:
+            return True
+        if self._login_code == 1002:
+            self._log("未登录：服务端返回「用户未登录」（code 1002）。请点「登录斗鱼」重新登录，"
+                      "扫码后等提示「登录成功」再关窗口。注意：同一账号在别处登录会把这里的会话挤掉。",
+                      "error")
+        else:
+            self._log("未登录（panelInfo code=%s / 网络缓存 %s）。请点「登录斗鱼」完成登录后再挂机。"
+                      % (self._login_code, "无" if not self._net_fresh("panel") else "未登录"), "error")
+        return False
+
+    def _wait_login(self, timeout=45):
+        """登录判定（双通道）：网络回调缓存的 panelInfo 优先，页面 __WM 兜底。"""
         t0 = time.time()
-        code = None
-        while time.time() - t0 < 45:
+        while time.time() - t0 < timeout:
             if self._stop.is_set():
                 return False
+            # 通道 1：网络回调
+            if self._net.get("nick"):
+                self.status["nick"] = self._net["nick"]
+                self._log("登录账号：%s（网络回调）" % self._net["nick"])
+                return True
+            if self._net.get("notLogin"):
+                self._login_code = 1002
+                return False
+            # 通道 2：页面 hook
             try:
-                info = self._page.evaluate(
+                info = self._eval(
                     "() => window.__WM && window.__WM.panelInfo ? {code: window.__WM.panelInfo.code, "
                     "nick: (window.__WM.panelInfo.data && window.__WM.panelInfo.data.userInfo && "
                     "window.__WM.panelInfo.data.userInfo.nn) || ''} : null")
             except Exception:
                 info = None
             if info:
-                code = info.get("code")
+                self._login_code = info.get("code")
                 if info.get("nick"):
                     self.status["nick"] = info["nick"]
                     self._log("登录账号：%s" % info["nick"])
                     return True
-                if code == 1002:
-                    break
+                if self._login_code == 1002:
+                    return False
             time.sleep(1)
-        st = self._state()
-        if st:
-            self._sync_status(st)
-            if self.status.get("nick"):
-                self._log("登录账号：%s" % self.status["nick"])
-                return True
-        self._log("似乎未登录（panelInfo code=%s）。请点「登录斗鱼」完成登录后再挂机。" % code, "error")
+        # 最后再看一次网络缓存（慢网）
+        if self._net.get("nick"):
+            self.status["nick"] = self._net["nick"]
+            self._log("登录账号：%s（网络回调）" % self._net["nick"])
+            return True
         return False
 
     def _wait_ready(self, timeout):
-        """等待页面出现主界面按钮或战场（数据就绪才算数，防止刷新后过早操作）"""
+        """等待页面出现主界面按钮或战场（数据就绪才算数，防止刷新后过早操作）
+
+        防封改造后 __WM 可能不可用，就绪判定放宽为：
+          按钮文案含「关」或数字，且（页面 panelReady 或 网络已收到 panelInfo 或 freeNum 已知）。
+        每 15 秒打一次诊断，避免「浏览器开着但不动」时无从排查。
+        """
         t0 = time.time()
+        last_diag = 0.0
         while time.time() - t0 < timeout:
             if self._stop.is_set():
                 return False
             st = self._state()
             if st:
+                wm = st.get("wm") or {}
+                txt = st.get("challengeTxt") or ""
+                net_ok = self._net_fresh("panel", 180) or wm.get("freeNum") is not None
                 if st.get("canChallenge"):
-                    wm = st.get("wm") or {}
-                    txt = st.get("challengeTxt") or ""
-                    if wm.get("panelReady") and (("关" in txt) or re.search(r"\d", txt)):
+                    if (wm.get("panelReady") or net_ok) and (("关" in txt) or re.search(r"\d", txt)):
                         return True
                 elif st.get("inBattle") or st.get("result") or st.get("treasure") \
                         or st.get("skillPanel") or st.get("finalSkillList"):
                     return True
-            time.sleep(0.8)
+                now = time.time()
+                if now - last_diag >= 15:
+                    last_diag = now
+                    self._log("[诊断] 等待页面就绪：btn=%r canChallenge=%s panelReady=%s "
+                              "网络panel=%s freeNum=%s 驱动=%s"
+                              % (txt[:24], bool(st.get("canChallenge")),
+                                 bool(wm.get("panelReady")),
+                                 "有" if self._net_fresh("panel", 180) else "无",
+                                 wm.get("freeNum"), DRIVER_NAME), "warn")
+            time.sleep(jitter(0.8, -0.15, 0.35))
         return False
+
+    def _eval(self, js, arg=None):
+        """在**页面主世界**执行 JS。
+
+        为什么必须有这个包装：patchright 的 page.evaluate 默认
+        isolatedContext=True（隔离世界），与页面主世界不通——
+        在里面看不到 window.__reactFiber$、看不到页面 fetch、也拿不到游戏引擎实例。
+        这会让回血/秒杀/抓包 hook 全部失效（表现为「浏览器开着但什么都不做」）。
+        因此统一强制主世界；同时兼容没有该参数的 playwright。
+        """
+        try:
+            if arg is None:
+                return self._page.evaluate(js, isolatedContext=False)
+            return self._page.evaluate(js, arg, isolatedContext=False)
+        except TypeError:
+            # 旧版 driver 不接受 isolatedContext（playwright 降级路径）
+            if arg is None:
+                return self._page.evaluate(js)
+            return self._page.evaluate(js, arg)
 
     def _click(self, js, *args):
         try:
-            return self._page.evaluate(js, args[0]) if args else self._page.evaluate(js)
+            return self._eval(js, args[0]) if args else self._eval(js)
         except Exception as e:
             self._log("点击执行失败：%s" % str(e)[:120], "warn")
             return None
@@ -1317,12 +1773,17 @@ class GuardFishBot:
 
     def _run(self):
         ensure_dirs()
+        self._load_active()
         try:
             self._ensure_browser()
             if not self._goto_game():
                 self.status["state"] = "未登录"
                 return
 
+            self._log("驱动：%s｜日活跃上限：%s"
+                      % (DRIVER_NAME,
+                         ("%d 分钟（超限休息 %d 分钟）" % (self.daily_limit_min, self.rest_min))
+                         if self.daily_limit_min > 0 else "不限"))
             rounds_done = 0
             i = 0
             while True:
@@ -1332,7 +1793,9 @@ class GuardFishBot:
                 if self._stop.is_set():
                     break
                 self.status["round"] = i
+                t_round = time.time()
                 r = self._one_battle(i)
+                self._add_active(time.time() - t_round)
                 if r is None:
                     self._log("第%d场未能完成，停止。" % i, "error")
                     break
@@ -1355,6 +1818,11 @@ class GuardFishBot:
                              ("结算：" + (r.get("resultText") or "")) if r.get("resultText") else ""))
                 if self._stop.is_set():
                     break
+                # 日活跃上限：累计活跃超限则长休（防止 7x24 特征）
+                if self._daily_limit_reached():
+                    if not self._long_rest():
+                        break
+                    continue
                 if i < self.rounds:
                     self._sleep_gap()
 
@@ -1374,12 +1842,71 @@ class GuardFishBot:
             except Exception:
                 pass
 
+    # -------- 日活跃计时（防 7x24 特征）--------
+    def _active_path(self):
+        return os.path.join(DATA_DIR, "active_state.json")
+
+    def _load_active(self):
+        try:
+            with open(self._active_path(), encoding="utf-8") as f:
+                d = json.load(f)
+            if d.get("date") == self._date:
+                self._active_sec = float(d.get("sec") or 0)
+            else:
+                self._active_sec = 0.0     # 跨天重置
+        except Exception:
+            self._active_sec = 0.0
+
+    def _save_active(self):
+        try:
+            with open(self._active_path(), "w", encoding="utf-8") as f:
+                json.dump({"date": self._date, "sec": round(self._active_sec, 1)}, f)
+        except Exception:
+            pass
+
+    def _add_active(self, sec):
+        """累加活跃秒数；跨天自动重置"""
+        today = datetime.date.today().strftime("%Y%m%d")
+        if today != self._date:
+            self._date = today
+            self._active_sec = 0.0
+        self._active_sec += max(0.0, float(sec or 0))
+        self._save_active()
+
+    def _daily_limit_reached(self):
+        if self.daily_limit_min <= 0:
+            return False
+        return self._active_sec >= self.daily_limit_min * 60
+
+    def _long_rest(self):
+        """达到日上限后的长休。返回 False 表示被用户停止。"""
+        rest = max(1, self.rest_min) * 60
+        self._log("已达到每日活跃上限 %d 分钟，休息 %d 分钟（防 7x24 特征）…"
+                  % (self.daily_limit_min, self.rest_min), "warn")
+        self.status["state"] = "日上限休息"
+        t0 = time.time()
+        while time.time() - t0 < rest:
+            if self._stop.is_set():
+                return False
+            time.sleep(min(5.0, rest - (time.time() - t0)))
+        # 休息结束视为跨入新的一天配额
+        self._active_sec = 0.0
+        self._save_active()
+        self._log("休息结束，继续挂机")
+        self.status["state"] = "运行中"
+        return True
+
     def _sleep_gap(self):
         lo, hi = min(self.gap_min, self.gap_max), max(self.gap_min, self.gap_max)
         if hi <= 0:
             return
         sec = random.uniform(max(lo, 1), max(hi, 2))
-        self._log("场间等待 %.0f 秒…" % sec)
+        # 长尾休息：12% 概率插入一段较长等待，避免间隔分布过于整齐
+        extra = ""
+        if random.random() < 0.12:
+            sec = random.uniform(40, 150)
+            extra = "（长尾休息）"
+        self._log("场间等待 %.0f 秒…%s" % (sec, extra))
         t0 = time.time()
         while time.time() - t0 < sec:
             if self._stop.is_set():
@@ -1404,7 +1931,7 @@ class GuardFishBot:
             if st.get("result") or st.get("treasure"):
                 r = self._click(JS_RESULT_BTN)
                 self._log("清理残留弹窗：%s" % r)
-                time.sleep(1.2)
+                usleep(1.2)
                 continue
             if st.get("finalSkillList"):
                 r = self._click(JS_CLICK_FINAL_START)
@@ -1413,7 +1940,7 @@ class GuardFishBot:
                 else:
                     self._log("残留的技能确认列表 → 未能开始（%s）"
                               % ((r or {}).get("why") if isinstance(r, dict) else "no-skillList"), "warn")
-                time.sleep(1.5)
+                usleep(1.5)
                 continue
             break
 
@@ -1430,6 +1957,7 @@ class GuardFishBot:
             self._snap("pre_battle_retry")
             try:
                 self._page.reload(wait_until="domcontentloaded", timeout=60000)
+                self._inject_page_scripts()
                 self._wait_ready(60)
                 self._apply_hp_config()
             except Exception as e:
@@ -1456,14 +1984,16 @@ class GuardFishBot:
         hp_found_logged = False
         last_progress_ts = time.time()
         last_sig = None
+        # 清掉上一场的残留事件：把序号对齐到当前总数
         try:
-            self._page.evaluate(JS_HP_DRAIN)      # 清掉上一场的残留事件
+            st0 = self._gf_status() or {}
+            self._gf_ev_idx = int(st0.get("evTotal") or 0)
         except Exception:
-            pass
+            self._gf_ev_idx = 0
         while time.time() - t_battle0 < MAX_BATTLE_SECONDS:
             if self._stop.is_set():
                 return None
-            time.sleep(TICK)
+            time.sleep(jitter(TICK, -0.08, 0.12))
             st = self._state()
             if not st:
                 continue
@@ -1473,11 +2003,8 @@ class GuardFishBot:
             if stage0 is None and stage.get("curStage"):
                 stage0 = stage.get("curStage")
 
-            # 血条守护：回收事件（回血/掉血）
-            try:
-                gf = self._page.evaluate(JS_HP_DRAIN)
-            except Exception:
-                gf = None
+            # 血条守护：回收事件（回血/掉血）——走 localStorage 通道
+            gf = self._gf_status()
             if gf:
                 if gf.get("found") and not hp_found_logged:
                     hp_found_logged = True
@@ -1487,7 +2014,17 @@ class GuardFishBot:
                 if gf.get("oneHitKills") is not None:
                     self._one_hit_kills = int(gf.get("oneHitKills") or 0)
                     self.status["one_hit_kills"] = self._one_hit_kills
-                for ev in (gf.get("events") or []):
+                # 只处理新事件（代理每次发布最近 200 条 + 总序号）
+                total = int(gf.get("evTotal") or 0)
+                base = int(gf.get("evBase") or 0)
+                evs = gf.get("events") or []
+                if total > self._gf_ev_idx:
+                    start = max(0, self._gf_ev_idx - base)
+                    new_evs = evs[start:]
+                    self._gf_ev_idx = total
+                else:
+                    new_evs = []
+                for ev in new_evs:
                     if ev.get("type") == "refill":
                         hp_refill_count += 1
                         self._log("回血触发：血量 %s → %s（第 %d 次）"
@@ -1527,7 +2064,7 @@ class GuardFishBot:
             if st.get("inBattle") and not snap_done:
                 snap_done = True
                 try:
-                    html = self._page.evaluate(JS_HUD_HTML)
+                    html = self._eval(JS_HUD_HTML)
                     if html:
                         with open(os.path.join(LOGDIR, "hud_sample.html"), "w", encoding="utf-8") as f:
                             f.write(html)
@@ -1548,19 +2085,27 @@ class GuardFishBot:
                 had_result = bool(st.get("result"))
                 if had_result:
                     result_text = self._click(JS_RESULT_TEXT) or ""
+                # 人类行为：看一眼结算数据再点
+                time.sleep(random.uniform(0.8, 2.2))
                 r = self._click(JS_RESULT_BTN)
                 self._log("%s弹窗 → %s %s" % ("结算" if had_result else "奖励", r,
                                               ("｜" + result_text[:120]) if result_text else ""))
-                time.sleep(2.0)
+                usleep(2.0)
                 st2 = self._state() or {}
                 if st2.get("treasure"):
                     r2 = self._click(JS_RESULT_BTN)
                     self._log("奖励弹窗 → %s" % r2)
-                    time.sleep(1.5)
+                    usleep(1.5)
                 st3 = self._state() or {}
-                if had_result and not st3.get("result") and not st3.get("treasure"):
+                # 判定本场结束：只看「战场消失 + 主界面挑战按钮出现」。
+                # 不能只看弹窗——新版把「宝箱奖励」也做成了 Result-module_modal，
+                # 只看弹窗会在第一个宝箱掉落时误判本场结束（实测 6 秒就结束）。
+                if not st3.get("inBattle") and st3.get("canChallenge") \
+                        and not st3.get("skillPanel") and not st3.get("finalSkillList"):
                     ended = "结算完成"
                     break
+                usleep(1.0)
+                continue
 
             # 3.2 关卡技能三选一
             cards = st.get("skillPanel")
@@ -1570,10 +2115,11 @@ class GuardFishBot:
                 best = scores.index(max(scores))
                 self._log("第%s关技能三选一 → 选 #%d（%d分）：%s"
                           % (stage.get("curStage", "?"), best + 1, max(scores), texts[best][:70]))
+                time.sleep(random.uniform(0.4, 1.4))
                 got = self._click(JS_CLICK_SKILL, best)
                 if got:
                     skills_chosen.append({"text": texts[best][:80], "score": max(scores)})
-                time.sleep(2.2)
+                usleep(2.2)
                 continue
 
             # 3.3 每周宝箱领取（免费）
@@ -1582,12 +2128,12 @@ class GuardFishBot:
                 r = self._click(JS_HUD_CLAIM)
                 if r:
                     self._log("领取战斗宝箱")
-                    time.sleep(1.5)
+                    usleep(1.5)
                     st2 = self._state() or {}
                     if st2.get("treasure"):
                         self._click(JS_RESULT_BTN)
                         self._log("宝箱奖励弹窗已关闭")
-                        time.sleep(1.0)
+                        usleep(1.0)
 
             # 3.4 异常兜底：若既不在战场也无面板
             if not st.get("inBattle") and not st.get("skillPanel") and not st.get("result") \
@@ -1617,6 +2163,7 @@ class GuardFishBot:
             try:
                 self._log("刷新页面恢复…", "warn")
                 self._page.reload(wait_until="domcontentloaded", timeout=60000)
+                self._inject_page_scripts()
                 self._wait_ready(60)
                 self._apply_hp_config()
                 self._log("页面已恢复")
@@ -1651,6 +2198,7 @@ class GuardFishBot:
         try:
             self._log("刷新页面恢复…", "warn")
             self._page.reload(wait_until="domcontentloaded", timeout=60000)
+            self._inject_page_scripts()
             ok = self._wait_ready(60)
             try:
                 self._apply_hp_config()
@@ -1671,35 +2219,232 @@ class GuardFishBot:
 
 
 # ---------------------------------------------------------------- 登录
+def page_login_state(page):
+    """从页面内容判断登录态。
+
+    为什么要这么绕：未登录时游戏页也会渲染一个占位按钮「开启挑战 0」
+    （canChallenge=True），所以「按钮存在」或「按钮含数字」都不能当登录成功的依据。
+    真正的信号是页面有没有加载出账号数据（周天梯/关卡），或者干脆显示「加载失败」。
+
+    返回 (state, detail)：'ok' 已登录 / 'no' 未登录 / None 还在加载
+    """
+    try:
+        d = page.evaluate("""() => {
+            const b = document.querySelector('[class*="challengeButton"]');
+            const btn = b ? (b.innerText || '').split(String.fromCharCode(10)).join(' ').trim() : '';
+            const body = (document.body.innerText || '').slice(0, 400);
+            return {btn: btn, body: body};
+        }""")
+    except Exception:
+        return None, ""
+    btn = (d.get("btn") or "").strip()
+    body = d.get("body") or ""
+    if "加载失败" in body or "用户未登录" in body:
+        return "no", body[:60]
+    has_data = ("周天梯" in body) or ("图鉴" in body) or ("关" in btn)
+    if has_data and ("关" in btn or "周天梯" in body):
+        return "ok", (btn or "已登录")
+    return None, btn
+
+
+def await_login_state(page, timeout=45, stable=5):
+    """轮询页面登录态；「已登录」必须**连续稳定** stable 秒才认可。
+
+    为什么要求稳定：游戏页会先用浏览器缓存渲染一次旧画面（可能短暂显示「周天梯」和
+    占位按钮「开启挑战 0」），随后接口失败才切成「加载失败」。单点采样会把这种
+    瞬时脏渲染误判成「已登录」——实测踩过。
+    返回 (ok, detail)
+    """
+    t0 = time.time()
+    ok_cnt = 0
+    no_cnt = 0
+    detail = ""
+    while time.time() - t0 < timeout:
+        st, d = page_login_state(page)
+        if d:
+            detail = d
+        if st == "ok":
+            ok_cnt += 1
+            no_cnt = 0
+            if ok_cnt >= stable:
+                return True, detail
+        elif st == "no":
+            no_cnt += 1
+            ok_cnt = 0
+            if no_cnt >= 2:          # 明确「加载失败」连续 2 次即判定未登录
+                return False, detail
+        time.sleep(1)
+    return False, detail
+
+
+def verify_login(timeout=45, headless=True, rid=DEFAULT_RID):
+    """独立复核登录态（打开游戏页 + 稳定判定）。
+
+    返回 (ok: bool, detail: str, code, msg)
+    """
+    state = {"code": None, "msg": ""}
+    ok, detail = False, ""
+    try:
+        with sync_playwright() as pw:
+            ctx, exe = launch_persistent(pw, PROFILE, headless=headless)
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+            def _on_resp(resp):
+                try:
+                    if "basics/panelInfo" not in resp.url:
+                        return
+                    j = json.loads(resp.text())
+                    state["code"] = j.get("code")
+                    state["msg"] = str(j.get("msg") or "")
+                except Exception:
+                    pass
+
+            page.on("response", _on_resp)
+            try:
+                page.goto(GAME_URL.format(rid=rid), wait_until="domcontentloaded", timeout=90000)
+            except Exception:
+                pass
+            ok, detail = await_login_state(page, timeout=timeout, stable=5)
+            try:
+                ctx.close()
+            except Exception:
+                pass
+    except Exception as e:
+        state["msg"] = str(e)[:150]
+    return ok, detail, state["code"], state["msg"]
+
+
 def open_login(rid=DEFAULT_RID):
-    """拉起持久化浏览器到斗鱼首页，供用户手动登录；关闭窗口后返回"""
+    """拉起浏览器登录，并在登录过程中实时检测是否真的登录成功。
+
+    改进点（旧版只说「窗口已关闭」，登录失败也看不出来）：
+      1. 先开斗鱼首页（有明确的「登录」入口；直接开游戏页只会显示“加载失败”）。
+      2. 盯 acf_auth 这个登录凭据的变化——一变化就自动跳到游戏页确认，
+         确认成功立刻打「✅ 登录成功」，提示用户可以关窗口。
+      3. 判定不是看按钮存在与否（未登录时也有占位按钮「开启挑战 0」），
+         而是要求页面**连续稳定**显示真实关卡（见 await_login_state）。
+      4. 关窗口前再复核一次，明确告知登录态到底有没有保存。
+    返回 True/False（是否确认登录成功）。
+    """
     ensure_dirs()
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+    try:
+        from patchright.sync_api import TimeoutError as PWTimeoutError
+    except Exception:
+        from playwright.sync_api import TimeoutError as PWTimeoutError
     kill_stale_chrome(PROFILE)
     clean_profile_locks(PROFILE)
-    log_msg("打开浏览器，请完成登录…")
+    log_msg("打开浏览器，请完成登录…（驱动：%s）" % DRIVER_NAME)
+
+    state = {"code": None, "nick": "", "msg": ""}
+    logged = False
+    login_detail = ""
     with sync_playwright() as pw:
         ctx, exe = launch_persistent(pw, PROFILE, headless=False)
         log_msg("浏览器：%s" % exe)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+        def _on_resp(resp):
+            try:
+                if "basics/panelInfo" not in resp.url:
+                    return
+                j = json.loads(resp.text())
+                state["code"] = j.get("code")
+                state["msg"] = str(j.get("msg") or "")
+                u = ((j.get("data") or {}).get("userInfo") or {})
+                if u.get("nn"):
+                    state["nick"] = u["nn"]
+            except Exception:
+                pass
+
+        page.on("response", _on_resp)
+        # 先开首页（首页有明确的「登录」入口，未登录时不会只显示“加载失败”）
         try:
             page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
         except Exception:
             pass
-        t0 = time.time()
-        while time.time() - t0 < 600:
+        log_msg("请扫码登录。登录成功后本程序会提示「登录成功」，届时再关闭浏览器窗口。")
+
+        def _acf():
+            """当前 acf_auth（登录凭据）。用变化来判断「刚刚登录成功」——"""
             try:
-                ctx.wait_for_event("close", timeout=5000)
+                for c in ctx.cookies():
+                    if c.get("name") == "acf_auth" and "douyu" in (c.get("domain") or ""):
+                        return c.get("value") or ""
+            except Exception:
+                pass
+            return ""
+
+        base_acf = _acf()
+        checked_acf = base_acf
+        t0 = time.time()
+        last_tip = 0.0
+        while time.time() - t0 < 600:
+            # 首页没有 panelInfo，靠登录凭据变化触发一次「跳到游戏页用 DOM 确认」
+            if not logged:
+                cur = _acf()
+                if cur and cur != checked_acf:
+                    checked_acf = cur
+                    log_msg("检测到新的登录凭据，正在确认…")
+                    try:
+                        page.goto(GAME_URL.format(rid=rid),
+                                  wait_until="domcontentloaded", timeout=60000)
+                        ok2, det2 = await_login_state(page, timeout=30, stable=3)
+                    except Exception as e:
+                        ok2, det2 = False, ""
+                        log_msg("确认失败：%s" % str(e)[:100], "warn")
+                    if ok2:
+                        logged = True
+                        login_detail = det2
+                        log_msg("✅ 登录成功：%s（现在可以关闭浏览器窗口了）" % det2)
+                    else:
+                        log_msg("登录凭据已更新，但游戏页仍不可用（%s），正在退回登录页，请重试"
+                                % (state["code"] or "页面加载失败"), "warn")
+                        try:
+                            page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+                        except Exception:
+                            pass
+            if not logged and (time.time() - last_tip) > 20:
+                last_tip = time.time()
+                log_msg("仍在等待登录…（%s）"
+                        % ("服务端返回未登录" if state["code"] == 1002 else "等待扫码"), "warn")
+            try:
+                ctx.wait_for_event("close", timeout=2000)
                 break
             except PWTimeoutError:
-                continue
+                pass
             except Exception:
                 break
+
+        # 关窗之前做最后一次确认：切到游戏页，稳定判定
+        if not logged:
+            try:
+                log_msg("正在复核登录态…")
+                page.goto(GAME_URL.format(rid=rid), wait_until="domcontentloaded", timeout=60000)
+                ok2, det2 = await_login_state(page, timeout=30, stable=3)
+                if ok2:
+                    logged = True
+                    login_detail = det2
+                    log_msg("✅ 登录成功：%s" % det2)
+            except Exception as e:
+                log_msg("复核失败：%s" % str(e)[:100], "warn")
+
         try:
             ctx.close()
         except Exception:
             pass
-    log_msg("登录窗口已关闭。登录态保存在：%s" % PROFILE)
+        time.sleep(0.8)      # 给 Chrome 一点时间把 cookie 落盘
+
+    if logged:
+        log_msg("✅ 登录成功并已保存（%s）。现在可以点「开始挂机」了。" % (login_detail or "已登录"))
+    else:
+        if state["code"] == 1002:
+            log_msg("登录未完成：服务端仍返回「用户未登录」（code 1002）。"
+                    "常见原因：① 扫码后没等跳转就关了窗口；② 同一账号在别处登录，"
+                    "把这里的会话挤掉了。请重新点「登录斗鱼」，等到提示「登录成功」再关窗口。", "error")
+        else:
+            log_msg("未检测到登录成功（%s）。请重新点「登录斗鱼」再试一次。"
+                    % (state["code"] or "游戏页显示加载失败"), "error")
+    return logged
 
 
 # ---------------------------------------------------------------- selftest
@@ -1728,10 +2473,10 @@ def selftest():
             emit("  rank=%d %s | %s" % (r, n, p))
     except Exception as e:
         emit("chrome_candidates FAIL: %s" % str(e)[:300])
-    emit("import playwright ...")
+    emit("driver: %s" % DRIVER_NAME)
+    emit("import %s ..." % DRIVER_NAME)
     try:
-        from playwright.sync_api import sync_playwright
-        emit("playwright import: OK")
+        emit("%s import: OK" % DRIVER_NAME)
         emit("sync_playwright().start() ...")
         with sync_playwright() as pw:
             emit("driver started")
@@ -1740,10 +2485,21 @@ def selftest():
             p = ctx.pages[0] if ctx.pages else ctx.new_page()
             p.goto("about:blank", timeout=15000)
             emit("about:blank: OK")
+            # 防封自检：webdriver / UA
+            try:
+                wd = p.evaluate("() => navigator.webdriver")
+                ua = p.evaluate("() => navigator.userAgent")
+                emit("navigator.webdriver: %r" % wd)
+                emit("userAgent: %s" % ua)
+                emit("UA 含 HeadlessChrome: %s" % ("HeadlessChrome" in (ua or "")))
+                emit("webdriver 检查: %s" % ("PASS" if not wd else "FAIL"))
+                emit("UA 检查: %s" % ("PASS" if "HeadlessChrome" not in (ua or "") else "FAIL"))
+            except Exception as e:
+                emit("反检测自检失败: %s" % str(e)[:200])
             ctx.close()
             emit("selftest: ALL OK")
     except Exception as e:
-        emit("playwright/launch FAIL: %s" % str(e)[:400])
+        emit("%s/launch FAIL: %s" % (DRIVER_NAME, str(e)[:400]))
         emit(traceback.format_exc()[-600:])
     return "\n".join(lines)
 
@@ -1765,13 +2521,17 @@ def main():
     ap.add_argument("--hp-threshold", type=int, default=5, help="回血阈值（血量低于该值回满，默认 5）")
     ap.add_argument("--no-coin", action="store_true", help="免费用尽后不用银币续打（默认会用，银币为免费获取）")
     ap.add_argument("--one-hit", action="store_true", help="秒杀模式：我方卡牌伤害直接击杀怪物")
+    ap.add_argument("--daily-limit", type=int, default=240,
+                    help="日活跃上限分钟（0=不限，默认 240）；超限后长休 --rest-min 分钟")
+    ap.add_argument("--rest-min", type=int, default=90, help="日上限后的长休分钟（默认 90）")
     args = ap.parse_args()
 
     if args.selftest:
         selftest()
         return
     if args.login:
-        open_login(args.rid)
+        ok = open_login(args.rid)
+        print("登录成功" if ok else "登录未完成（详见上方日志）")
         return
     if args.run:
         ensure_dirs()
@@ -1788,7 +2548,8 @@ def main():
                            gap_min=args.gap_min, gap_max=args.gap_max,
                            headless=args.headless, claim_weekpass=not args.no_claim,
                            hp_guard=not args.no_hp, hp_threshold=args.hp_threshold,
-                           coin_play=not args.no_coin, one_hit=args.one_hit)
+                           coin_play=not args.no_coin, one_hit=args.one_hit,
+                           daily_limit_min=args.daily_limit, rest_min=args.rest_min)
         bot.add_log_sink(sink)
         bot._log("命令行挂机启动：房间=%s 场数=%d%s%s" % (args.rid, args.rounds,
                  " [headless]" if args.headless else "",
@@ -1808,6 +2569,8 @@ def main():
     print("  --login          打开浏览器登录斗鱼（首次/掉登录后）")
     print("  --run            命令行挂机（--rounds N --rid 12306 --headless）")
     print("  --one-hit        秒杀模式：我方卡牌伤害直接击杀怪物")
+    print("  --daily-limit N  日活跃上限分钟（0=不限，默认 240），超限长休")
+    print("  --rest-min N     日上限后的长休分钟（默认 90）")
     print("  --no-hp          关闭血量低于阈值自动回满")
     print("  --no-coin        免费用尽后不用银币续打")
     print("  --selftest       环境自检")
