@@ -76,9 +76,10 @@ class App:
         ttk.Checkbutton(top, text="免费用尽后用银币续打（银币免费获得）",
                         variable=self.coin_var).grid(row=1, column=4, columnspan=5, sticky="w", pady=(8, 0))
 
-        # 秒杀模式：我方 9 张卡造成的任何伤害直接击杀怪物
+        # 秒杀模式（已内置低风险）：小概率一击必杀，其余打 55~90% 血量；
+        # 同时回血改为偶尔不回/不全回，避免对局数据明显不像真人
         self.one_hit_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top, text="秒杀模式（卡牌伤害直接击杀）",
+        ttk.Checkbutton(top, text="秒杀模式（低风险：仅约12%一击必杀）",
                         variable=self.one_hit_var).grid(row=1, column=9, columnspan=4,
                                                         sticky="w", pady=(8, 0))
 
@@ -240,7 +241,8 @@ class App:
                                            gap_max=gap_max, headless=headless,
                                            hp_guard=hp_guard, hp_threshold=hp_th,
                                            coin_play=coin_play, one_hit=one_hit,
-                                           daily_limit_min=daily_lim, rest_min=rest_min)
+                                           daily_limit_min=daily_lim, rest_min=rest_min,
+                                           safe_mode=one_hit)
             self.bot.add_log_sink(lambda line, level=None: LOG_Q.put((line, level)))
             self.bot.start()
             self.bot._thread.join()

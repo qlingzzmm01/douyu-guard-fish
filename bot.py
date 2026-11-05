@@ -19,6 +19,7 @@ import re
 import sys
 import json
 import time
+import base64
 import random
 import subprocess
 import tempfile
@@ -30,6 +31,10 @@ APP_NAME = "保卫鱼娘挂机助手"
 DEFAULT_RID = "12306"
 GAME_URL = "https://www.douyu.com/pages/vibe-lab-act202606-game/mine?rid={rid}&isAnchorSide=0"
 HOME_URL = "https://www.douyu.com/"
+
+# 1x1 透明 GIF：用于「假装上报成功」地拦掉埋点请求
+GIF_1PX = base64.b64decode(
+    "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 
 # ---------------------------------------------------------------- 防封基础工具
 # 驱动：优先 patchright（Playwright 反检测分支，API 完全兼容），不可用时降级 playwright。
@@ -386,8 +391,9 @@ JS_HP_WATCH = r"""
   const GF = window.__GF = {enabled: true, hpGuard: true, threshold: 5, refills: 0, hpEvents: [], hp: null,
                             mgrRef: null, loopRef: null, wrapped: false, foundOnce: false,
                             fullHp: 0,
-                            battleT0: 0, maxRefillMs: 540000, capped: false,
+                            battleT0: 0, maxRefillMs: 0, capped: false,
                             oneHit: false, oneHitKills: 0, oneHitWrapped: false,
+                            safe: false, killProb: 0.12,
                             scanCount: 0, scanInfo: null, diag: null, err: null, comp: ''};
   // 解析：ref.current 可能是 BattleLoop（直接含 coreHp）或 BattleManager（显示层，coreHp 在 .loop 里）
   function resolveTarget(c) {
@@ -485,8 +491,8 @@ JS_HP_WATCH = r"""
       if (!GF.hpGuard) return;
       if (!loop || typeof loop.coreHp !== 'number') return;
       if (loop.running === false) return;
-      // 回血时间上限：单场接近服务端 600 秒上限时主动停手，让战斗自然结束
-      if (GF.battleT0 && (Date.now() - GF.battleT0) > GF.maxRefillMs) {
+      // 回血时间上限：默认 0 = 不限（跟随"单场不限时"）。设 >0 时到点停手让战斗自然结束。
+      if (GF.maxRefillMs > 0 && GF.battleT0 && (Date.now() - GF.battleT0) > GF.maxRefillMs) {
         if (!GF.capped) {
           GF.capped = true;
           GF.hpEvents.push({t: Date.now(), type: 'cap', mins: Math.round(GF.maxRefillMs / 60000)});
@@ -498,7 +504,17 @@ JS_HP_WATCH = r"""
         // 不用当前关继承来的低血量（否则跨关后会只回到低值甚至原地打转）
         const stageMax = (loop.config && loop.config.battle && loop.config.battle.baseCoreHp) || 20;
         if (stageMax > (GF.fullHp || 0)) GF.fullHp = stageMax;
-        const target = Math.max(GF.fullHp || 0, 20);
+        let target = Math.max(GF.fullHp || 0, 20);
+        // 低风险模式：不死也保持不住——偶尔不回血、且不总回满，
+        // 让战斗存在真实死亡的可能（真实玩家的基地是会爆的）
+        if (GF.safe) {
+          if (Math.random() < 0.22) {
+            GF.hpEvents.push({t: Date.now(), type: 'skip', hp: loop.coreHp});
+            return;
+          }
+          const lo = Math.max(6, Math.round(target * 0.55));
+          target = lo + Math.floor(Math.random() * (target - lo + 1));
+        }
         if (target <= loop.coreHp) return;   // 防呆：无法提升就不再尝试
         const before = loop.coreHp;
         loop.coreHp = target;
@@ -509,6 +525,37 @@ JS_HP_WATCH = r"""
     } catch (e) { GF.err = String(e); }
   }
   window.__gfRefill = refill;
+  // 伤害包装：抽成独立函数，既供 tick 调用，也方便单测（window.__gfWrapDamage）
+  function wrapDamage(loop) {
+    if (!loop || loop.__gfOneHitWrapped) return false;
+    const proto2 = Object.getPrototypeOf(loop);
+    const orig2 = loop._dealDamage || (proto2 && proto2._dealDamage);
+    if (typeof orig2 !== 'function') return false;
+    loop._dealDamage = function (enemy, damage, cardId, isCrit) {
+      try {
+        if (enemy && typeof enemy.currentHp === 'number' && enemy.currentHp > 0) {
+          if (GF.safe) {
+            const p = (GF.killProb === undefined) ? 0.12 : GF.killProb;
+            if (Math.random() < p) {
+              GF.oneHitKills++;
+              return orig2.call(this, enemy, enemy.currentHp, cardId, isCrit);
+            }
+            const r = 0.55 + Math.random() * 0.35;
+            const dmg = Math.max(1, Math.floor(enemy.currentHp * r));
+            return orig2.call(this, enemy, dmg, cardId, isCrit);
+          }
+          if (GF.oneHit) {
+            GF.oneHitKills++;
+            return orig2.call(this, enemy, enemy.currentHp, cardId, isCrit);
+          }
+        }
+      } catch (e) { GF.err = String(e); }
+      return orig2.call(this, enemy, damage, cardId, isCrit);
+    };
+    loop.__gfOneHitWrapped = true;
+    return true;
+  }
+  window.__gfWrapDamage = wrapDamage;
   let lastHp = null;
   let lastScan = 0;
   setInterval(() => {
@@ -522,7 +569,13 @@ JS_HP_WATCH = r"""
           GF.hpGuard = !!c.hpGuard;
           GF.oneHit = !!c.oneHit;
           GF.threshold = Number(c.threshold) || 5;
-          GF.enabled = !!(GF.hpGuard || GF.oneHit);
+          // 低风险模式的两个开关必须在这里落地——漏读会让 GF.safe 恒为 undefined，
+          // 概率分支被跳过、每次都走秒杀（v1.0.14/15 的实际故障）。
+          GF.safe = !!c.safe;
+          GF.killProb = Number(c.killProb);
+          if (!isFinite(GF.killProb) || GF.killProb < 0 || GF.killProb > 1) GF.killProb = 0.12;
+          if (c.refillCapMs !== undefined) GF.maxRefillMs = Number(c.refillCapMs) || 0;
+          GF.enabled = !!(GF.hpGuard || GF.oneHit || GF.safe);
         }
       } catch (e) {}
       // 一次性命令通道（开局打点 / 清零计数）
@@ -546,6 +599,7 @@ JS_HP_WATCH = r"""
             comp: GF.comp || '', hp: GF.hp,
             oneHit: !!GF.oneHit, oneHitWrapped: !!GF.oneHitWrapped,
             oneHitKills: GF.oneHitKills || 0,
+            safe: !!GF.safe, killProb: GF.killProb,
             scanCount: GF.scanCount || 0, scanInfo: GF.scanInfo, err: GF.err,
             evTotal: GF.hpEvents.length, evBase: base,
             events: GF.hpEvents.slice(base)
@@ -581,25 +635,13 @@ JS_HP_WATCH = r"""
           }
         } catch (e) { GF.err = String(e); }
       }
-      // 秒杀：包装 _dealDamage，把本次伤害抬到「恰好等于敌人当前血量」。
-      // 原实现 actualDmg = min(max(1,floor(damage)), enemy.currentHp)，因此传 currentHp
-      // 必然打成 0 → 走原生的 _killEnemy（伤害统计/击杀回调/掉落/清关判定全部保留）。
+      // 秒杀/伤害弱化：包装 _dealDamage。
+      // 原实现 actualDmg = min(max(1,floor(damage)), enemy.currentHp)，
+      // 因此传 currentHp 必然打成 0 → 走原生的 _killEnemy（伤害统计/击杀回调/掉落/清关全保留）。
+      // 低风险模式下只有 killProb 概率这样打，其余只打 55%~90%，需要 2~3 次命中。
       if (!loop.__gfOneHitWrapped) {
         try {
-          const proto2 = Object.getPrototypeOf(loop);
-          const orig2 = loop._dealDamage || (proto2 && proto2._dealDamage);
-          if (typeof orig2 === 'function') {
-            loop._dealDamage = function (enemy, damage, cardId, isCrit) {
-              try {
-                if (GF.oneHit && enemy && typeof enemy.currentHp === 'number' && enemy.currentHp > 0) {
-                  GF.oneHitKills++;
-                  return orig2.call(this, enemy, enemy.currentHp, cardId, isCrit);
-                }
-              } catch (e) { GF.err = String(e); }
-              return orig2.call(this, enemy, damage, cardId, isCrit);
-            };
-            loop.__gfOneHitWrapped = true; GF.oneHitWrapped = true;
-          }
+          if (wrapDamage(loop)) { GF.oneHitWrapped = true; }
         } catch (e) { GF.err = String(e); }
       }
       const hp = loop.coreHp;
@@ -659,6 +701,182 @@ JS_GF_BOOT = r"""
     return 'err:' + String(e).slice(0, 80);
   }
 }
+"""
+
+# 通用主世界执行通道：把任意脚本源码以运行时 <script> 插进页面主世界。
+# （patchright 的 evaluate 在隔离世界，装指纹补丁必须走这条路）
+JS_MAIN_EVAL = r"""
+(src) => {
+  try {
+    const s = document.createElement('script');
+    s.textContent = src;
+    (document.head || document.documentElement).appendChild(s);
+    s.remove();
+    return 'ok';
+  } catch (e) {
+    return 'err:' + String(e).slice(0, 80);
+  }
+}
+"""
+
+# 指纹补丁（主世界）。
+# 设计原则：**只在异常时才改**——真 Chrome 窗口模式下所有检测项都正常，
+# 这段脚本全程 no-op，不会给正常环境引入任何"被改过"的痕迹。
+# 只处理 headless / 软件渲染下必然异常、且真实浏览器绝不会出现的项：
+#   1. window.chrome 缺失
+#   2. navigator.plugins 为空（headless 经典特征）
+#   3. hardwareConcurrency / deviceMemory 为 0
+#   4. WebGL UNMASKED_RENDERER 是 SwiftShader/llvmpipe（软件渲染）
+#   5. Notification.permission 恒为 denied
+JS_FP_HARDEN = r"""
+(() => {
+  try {
+    if (window.__GF_FP) return;
+    const done = [];
+    const mask = (fn, name) => {
+      try {
+        const orig = Function.prototype.toString;
+        if (!Function.prototype.__gfMasked) {
+          const table = new WeakMap();
+          Function.prototype.toString = function () {
+            const n = table.get(this);
+            if (n) return 'function ' + n + '() { [native code] }';
+            return orig.call(this);
+          };
+          Object.defineProperty(Function.prototype, '__gfMasked', {value: table});
+        }
+        Function.prototype.__gfMasked.set(fn, name);
+      } catch (e) {}
+    };
+
+    // 1) window.chrome
+    try {
+      if (!window.chrome) {
+        window.chrome = {
+          app: {isInstalled: false, InstallState: {DISABLED: 'disabled'},
+                RunningState: {RUNNING: 'running'}},
+          runtime: {}, csi: function () {}, loadTimes: function () {}
+        };
+        done.push('chrome');
+      }
+    } catch (e) {}
+
+    // 2) navigator.plugins 为空
+    try {
+      if (!navigator.plugins || navigator.plugins.length === 0) {
+        const mkMime = () => {
+          const m = Object.create(MimeType.prototype);
+          Object.defineProperty(m, 'type', {value: 'application/pdf'});
+          Object.defineProperty(m, 'suffixes', {value: 'pdf'});
+          Object.defineProperty(m, 'description', {value: 'Portable Document Format'});
+          return m;
+        };
+        const mk = (name) => {
+          const p = Object.create(Plugin.prototype);
+          Object.defineProperty(p, 'name', {value: name});
+          Object.defineProperty(p, 'description', {value: 'Portable Document Format'});
+          Object.defineProperty(p, 'filename', {value: 'internal-pdf-viewer'});
+          Object.defineProperty(p, 'length', {value: 1});
+          const m = mkMime();
+          Object.defineProperty(m, 'enabledPlugin', {value: p});
+          Object.defineProperty(p, '0', {value: m});
+          return p;
+        };
+        const list = ['PDF Viewer', 'Chrome PDF Viewer', 'Chromium PDF Viewer',
+                      'Microsoft Edge PDF Viewer', 'WebKit built-in PDF'].map(mk);
+        const arr = Object.create(PluginArray.prototype);
+        list.forEach((p, i) => Object.defineProperty(arr, i, {value: p}));
+        Object.defineProperty(arr, 'length', {value: list.length});
+        Object.defineProperty(Navigator.prototype, 'plugins', {
+          configurable: true, get: function () { return arr; }
+        });
+        mask(Object.getOwnPropertyDescriptor(Navigator.prototype, 'plugins').get, 'get plugins');
+        done.push('plugins');
+      }
+    } catch (e) {}
+
+    // 3) CPU / 内存为 0
+    try {
+      if (!navigator.hardwareConcurrency) {
+        Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', {
+          configurable: true, get: function () { return 8; }
+        });
+        mask(Object.getOwnPropertyDescriptor(Navigator.prototype, 'hardwareConcurrency').get,
+             'get hardwareConcurrency');
+        done.push('cores');
+      }
+      if (!navigator.deviceMemory) {
+        Object.defineProperty(Navigator.prototype, 'deviceMemory', {
+          configurable: true, get: function () { return 8; }
+        });
+        mask(Object.getOwnPropertyDescriptor(Navigator.prototype, 'deviceMemory').get,
+             'get deviceMemory');
+        done.push('mem');
+      }
+    } catch (e) {}
+
+    // 4) WebGL 软件渲染
+    //    先探测当前 renderer；不是软件渲染就完全不包装 getParameter，
+    //    保证真机（有独显）路径 100% 零改动。
+    try {
+      const probe = () => {
+        const c = document.createElement('canvas');
+        const g = c.getContext('webgl') || c.getContext('experimental-webgl');
+        if (!g) return null;
+        const d = g.getExtension('WEBGL_debug_renderer_info');
+        if (!d) return null;
+        return {vendor: g.getParameter(d.UNMASKED_VENDOR_WEBGL),
+                renderer: g.getParameter(d.UNMASKED_RENDERER_WEBGL)};
+      };
+      const cur = probe();
+      const soft = cur && typeof cur.renderer === 'string' &&
+                   /swiftshader|llvmpipe|software|basic render/i.test(cur.renderer);
+      if (soft) {
+        const patch = (proto) => {
+          if (!proto || proto.__gfGL) return;
+          const orig = proto.getParameter;
+          const wrapped = function (p) {
+            if (p === 37446) {
+              const v = orig.apply(this, [p]);
+              if (typeof v === 'string' && /swiftshader|llvmpipe|software|basic render/i.test(v)) {
+                return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)';
+              }
+              return v;
+            }
+            if (p === 37445) {
+              const v = orig.apply(this, [p]);
+              if (typeof v === 'string' && /google/i.test(v)) return 'Google Inc. (NVIDIA)';
+              return v;
+            }
+            return orig.apply(this, [p]);
+          };
+          proto.getParameter = wrapped;
+          mask(wrapped, 'getParameter');
+          Object.defineProperty(proto, '__gfGL', {value: 1});
+        };
+        patch(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+        patch(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+        done.push('webgl:' + String(cur.renderer).slice(0, 30));
+      }
+    } catch (e) {}
+
+    // 5) 通知权限恒为 denied（headless）
+    try {
+      if (window.Notification && Notification.permission === 'denied') {
+        Object.defineProperty(Notification, 'permission', {
+          configurable: true, get: function () { return 'default'; }
+        });
+        done.push('notify');
+      }
+    } catch (e) {}
+
+    window.__GF_FP = {patched: done};
+    // 主世界的 window 变量在隔离世界里读不到，结果用 localStorage 回传给 Python
+    try { localStorage.setItem('gf_fp', JSON.stringify(done)); } catch (e) {}
+  } catch (e) {
+    try { localStorage.setItem('gf_fp', JSON.stringify(['error:' + String(e).slice(0, 60)])); } catch (e2) {}
+  }
+})();
 """
 
 # 从主世界代理读状态（localStorage 共享）
@@ -835,6 +1053,54 @@ JS_CLICK_SKILL = r"""
 }
 """
 
+# 技能三选一：直接点「一键随机选择」，不再逐张挑卡（点一次会把本轮所有选择随机选完）。
+#
+# 识别方式（2026-11-04 实测，按钮文字是背景图，innerText 为空，不能按文本找）：
+#   一键随机选择 <button class="Starter-module_btn-xxx Starter-module_auto-yyy">
+#                背景图 .../refresh-auto-<hash>.png
+#   刷新         <button class="Starter-module_btn-xxx">
+#                背景图 .../refresh-<hash>.png
+# 因此用「类名含 Starter-module_auto」或「背景图含 refresh-auto」**正向**识别；
+# 两者都不满足就放弃，绝不退化成"点第一个按钮"——右边那个是刷新，要鱼翅。
+JS_CLICK_RANDOM_SKILL = r"""
+() => {
+  const vis = el => { if (!el) return false; const r = el.getBoundingClientRect();
+    const s = getComputedStyle(el);
+    return r.width > 1 && r.height > 1 && s.display !== 'none' && s.visibility !== 'hidden'; };
+  const bgOf = el => { try { return getComputedStyle(el).backgroundImage || ''; } catch (e) { return ''; } };
+
+  const isAuto = el => {
+    const cls = String(el.className || '');
+    const bg = bgOf(el);
+    return /Starter-module_auto/.test(cls) || /refresh-auto/i.test(bg);
+  };
+
+  // 只在技能面板范围内找，缩小误判面
+  const scope = document.querySelector('[class*="Starter-module_skillsPanel"]')
+             || document.querySelector('[class*="SkillPanel-module_panel"]')
+             || document.body;
+
+  let btn = null;
+  for (const el of scope.querySelectorAll('button, [role="button"]')) {
+    if (vis(el) && isAuto(el)) { btn = el; break; }
+  }
+  if (!btn) {
+    for (const el of document.querySelectorAll('button')) {
+      if (vis(el) && isAuto(el)) { btn = el; break; }
+    }
+  }
+  if (!btn) return {ok: false, why: 'no-auto-btn'};
+
+  // 正向再确认一次，避免任何情况下点到「刷新」
+  if (!isAuto(btn)) return {ok: false, why: 'guard'};
+  const bg = bgOf(btn);
+  if (/refresh-/i.test(bg) && !/refresh-auto/i.test(bg)) return {ok: false, why: 'guard-refresh'};
+
+  try { btn.click(); } catch (e) { return {ok: false, why: 'click-threw'}; }
+  return {ok: true, cls: String(btn.className || ''), img: bg.slice(-40)};
+}
+"""
+
 JS_CLICK_FINAL_START = r"""
 () => {
   const vis = el => { if (!el) return false; const r = el.getBoundingClientRect();
@@ -1006,7 +1272,10 @@ class GuardFishBot:
     def __init__(self, rid=DEFAULT_RID, rounds=10, gap_min=5, gap_max=15,
                  headless=False, claim_weekpass=True, on_log=None,
                  hp_guard=True, hp_threshold=5, coin_play=True, one_hit=False,
-                 daily_limit_min=240, rest_min=90):
+                 daily_limit_min=240, rest_min=90,
+                 block_stats=True, fp_harden=True,
+                 safe_mode=None, safe_kill_prob=0.12,
+                 max_battle_min=0, refill_cap_min=0):
         self.rid = str(rid)
         self.rounds = int(rounds)
         self.gap_min = float(gap_min or 0)
@@ -1020,6 +1289,19 @@ class GuardFishBot:
         self._one_hit_kills = 0
         self.daily_limit_min = int(daily_limit_min or 0)   # 日活跃上限（分钟，0=不限）
         self.rest_min = int(rest_min or 90)                # 达到上限后长休（分钟）
+        # 防封加固开关
+        self.block_stats = bool(block_stats)   # 拦掉斗鱼通用埋点（与游戏无关）
+        self.fp_harden = bool(fp_harden)       # 主世界指纹补丁（仅在异常时才改）
+        # 低风险模式：弱化秒杀与回血，让对局数据看起来像真人
+        # （秒杀=每次伤害恰好等于剩余血量，是服务端伤害日志里可检测的数学指纹）
+        # 低风险已并入「秒杀模式」：不显式指定时，开秒杀即启用低风险口径
+        self.safe_mode = bool(one_hit) if safe_mode is None else bool(safe_mode)
+        self.safe_kill_prob = float(safe_kill_prob or 0.12)
+        # 单场时长：0 = 不限（默认）。非 0 时到点主动结束，仅作为卡死兜底。
+        self.max_battle_sec = int(max_battle_min or 0) * 60
+        # 回血时长上限（分钟，0=不限）；非 0 时到点停手让战斗自然结束
+        self.refill_cap_min = int(refill_cap_min or 0)
+        self._stats_blocked = 0
         self._battle_paid = "free"                # free / coin
 
         self._stop = threading.Event()
@@ -1097,6 +1379,13 @@ class GuardFishBot:
         self._ctx = ctx
         self._page = ctx.pages[0] if ctx.pages else ctx.new_page()
         self._log("浏览器就绪：%s（驱动：%s）" % (exe, DRIVER_NAME))
+        # 埋点拦截：斗鱼通用统计 GIF（与游戏无关，拦掉不影响任何玩法）
+        if self.block_stats:
+            try:
+                ctx.route("**/fish3/1.gif*", self._on_stats_beacon)
+                self._log("埋点上报拦截：开（dotserver fish3/1.gif）")
+            except Exception as e:
+                self._log("埋点拦截注册失败：%s" % str(e)[:100], "warn")
         # patchright 封死了 add_init_script / addScriptToEvaluateOnNewDocument，
         # 因此注入改为「每次导航后 evaluate 注入」，见 _inject_page_scripts。
         # playwright 降级路径下 init script 仍然可用，两者都保留更稳。
@@ -1133,6 +1422,23 @@ class GuardFishBot:
             ok.append("agent:%s" % r)
         except Exception as e:
             self._log("注入主世界代理失败：%s" % str(e)[:120], "warn")
+        # 指纹补丁（主世界）：正常环境下全程 no-op
+        if self.fp_harden:
+            try:
+                self._eval(JS_MAIN_EVAL, JS_FP_HARDEN)
+                fp = self._eval("() => { try { const v = localStorage.getItem('gf_fp');"
+                                " return v ? JSON.parse(v) : 'MISSING'; } catch (e) { return 'MISSING'; } }")
+                if fp == "MISSING":
+                    ok.append("fp:missing")
+                    self._log("指纹补丁未生效（主世界脚本没执行）", "warn")
+                elif fp:
+                    ok.append("fp:%s" % ",".join(fp))
+                    self._log("指纹补丁已生效：%s" % ", ".join(fp))
+                else:
+                    ok.append("fp:clean")
+                    self._log("指纹检测：无需修补（真实浏览器环境正常）")
+            except Exception as e:
+                self._log("指纹补丁失败：%s" % str(e)[:100], "warn")
         try:
             self._eval(JS_HOOK)
             ok.append("wm-hook")
@@ -1141,16 +1447,41 @@ class GuardFishBot:
         self._apply_hp_config()
         return ok
 
+    def _on_stats_beacon(self, route):
+        """拦掉斗鱼通用埋点：返回一张 1x1 透明 GIF，让埋点 SDK 以为上报成功。
+
+        为什么用 fulfill 而不是 abort：abort 会让 SDK 触发重试/错误回调，
+        反而制造额外异常；返回合法图片最安静。
+        注意：**不拦任何 /japi/revenuenc/web/actgame/** 接口**——那是游戏业务接口，
+        拦掉会导致推关/结算全部失败，而且「有开局没过程」本身就是更强的异常信号。
+        """
+        try:
+            route.fulfill(status=200, content_type="image/gif", body=GIF_1PX)
+            self._stats_blocked += 1
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
     def _apply_hp_config(self):
         """把回血/秒杀配置写入 localStorage（主世界代理每 250ms 读一次）"""
         cfg = {"hpGuard": bool(self.hp_guard),
                "threshold": int(self.hp_threshold),
-               "oneHit": bool(self.one_hit)}
+               "oneHit": bool(self.one_hit),
+               "safe": bool(self.safe_mode),
+               "killProb": float(self.safe_kill_prob),
+               "refillCapMs": int(self.refill_cap_min * 60000)}
         try:
             self._eval(JS_GF_CFG, cfg)
-            self._log("回血守护：%s（阈值 < %s 回满）｜秒杀模式：%s"
-                      % ("开" if cfg["hpGuard"] else "关", cfg["threshold"],
-                         "开" if cfg["oneHit"] else "关"))
+            if self.safe_mode:
+                self._log("秒杀模式：开（低风险口径：仅 %.0f%% 概率一击必杀，其余打 55~90%% 血量）"
+                          "｜回血：%s（阈值 < %s，偶尔不回/不全回）"
+                          % (self.safe_kill_prob * 100,
+                             "开" if cfg["hpGuard"] else "关", cfg["threshold"]))
+            else:
+                self._log("秒杀模式：关｜回血守护：%s（阈值 < %s 回满）"
+                          % ("开" if cfg["hpGuard"] else "关", cfg["threshold"]))
             return cfg
         except Exception as e:
             self._log("下发回血/秒杀配置失败：%s" % str(e)[:100], "warn")
@@ -1430,6 +1761,43 @@ class GuardFishBot:
             self._log("滚动到挑战按钮失败：%s" % str(e)[:100], "warn")
             return False
 
+    def _human_move(self, x, y, steps=None):
+        """沿二次贝塞尔曲线移动鼠标（带抖动），代替瞬移。
+
+        为什么：`mouse.move()` 一次性跳点，在 mousemove 事件序列上是
+        「一个点 → 另一个点」，与真人连续轨迹差异极大，且缺少时间分布。
+        这里按 8~18 段折线 + 每步 ±1.2px 抖动，并把总时长随机化到 180~420ms。
+        """
+        try:
+            cur = getattr(self, "_mouse_xy", None) or (random.randint(600, 900),
+                                                       random.randint(300, 500))
+            sx, sy = cur
+            if steps is None:
+                steps = random.randint(8, 18)
+            # 控制点：垂直于两点连线偏移，制造弧度
+            mx, my = (sx + x) / 2.0, (sy + y) / 2.0
+            dx, dy = x - sx, y - sy
+            dist = max(1.0, (dx * dx + dy * dy) ** 0.5)
+            off = random.uniform(-0.18, 0.18) * dist
+            cx, cy = mx - dy / dist * off, my + dx / dist * off
+            total = random.uniform(0.18, 0.42)
+            for i in range(1, steps + 1):
+                t = i / float(steps)
+                bx = (1 - t) ** 2 * sx + 2 * (1 - t) * t * cx + t * t * x
+                by = (1 - t) ** 2 * sy + 2 * (1 - t) * t * cy + t * t * y
+                bx += random.uniform(-1.2, 1.2)
+                by += random.uniform(-1.2, 1.2)
+                self._page.mouse.move(bx, by)
+                time.sleep(total / steps * random.uniform(0.6, 1.5))
+            self._page.mouse.move(x, y)
+            self._mouse_xy = (x, y)
+        except Exception:
+            try:
+                self._page.mouse.move(x, y)
+                self._mouse_xy = (x, y)
+            except Exception:
+                pass
+
     def _trusted_click(self, selector, label=""):
         """真实鼠标点击元素中心（isTrusted=true）。找不到/不可见时返回 False。"""
         try:
@@ -1444,7 +1812,7 @@ class GuardFishBot:
                 return False
             x = box["x"] + random.uniform(-2.5, 2.5)
             y = box["y"] + random.uniform(-2.0, 2.0)
-            self._page.mouse.move(x, y)
+            self._human_move(x, y)
             time.sleep(random.uniform(0.08, 0.25))
             self._page.mouse.down()
             time.sleep(random.uniform(0.03, 0.09))
@@ -1456,6 +1824,17 @@ class GuardFishBot:
             if label:
                 self._log("鼠标点击 %s 失败：%s" % (label, str(e)[:100]), "warn")
             return False
+
+    def _click_random_skill(self, retries=2):
+        """点「一键随机选择」；面板重绘瞬间可能短暂找不到，重试一次再放弃。"""
+        r = None
+        for i in range(max(1, retries)):
+            r = self._click(JS_CLICK_RANDOM_SKILL)
+            if isinstance(r, dict) and r.get("ok"):
+                return r
+            if i + 1 < retries:
+                usleep(0.8)
+        return r
 
     def _click_challenge(self, st=None):
         """点「开启挑战」：优先可信鼠标点击（必要时先滚动），失败再退回 JS click。"""
@@ -1581,6 +1960,15 @@ class GuardFishBot:
 
             cards = st.get("skillPanel")
             if cards:
+                # 优先「一键随机选择」（点一次把所有轮次随机选完）
+                time.sleep(random.uniform(0.4, 1.2))
+                rr = self._click_random_skill()
+                if isinstance(rr, dict) and rr.get("ok"):
+                    self._log("前置技能三选一 → 一键随机选择")
+                    info["skills"].append({"text": "一键随机选择", "score": 0, "random": True})
+                    last_progress = time.time()
+                    usleep(1.8)
+                    continue
                 texts = [c.get("txt", "") for c in cards]
                 scores = [score_skill_text(t) for t in texts]
                 best = scores.index(max(scores))
@@ -1780,10 +2168,16 @@ class GuardFishBot:
                 self.status["state"] = "未登录"
                 return
 
-            self._log("驱动：%s｜日活跃上限：%s"
+            self._log("驱动：%s｜日活跃上限：%s｜单场：%s"
                       % (DRIVER_NAME,
                          ("%d 分钟（超限休息 %d 分钟）" % (self.daily_limit_min, self.rest_min))
-                         if self.daily_limit_min > 0 else "不限"))
+                         if self.daily_limit_min > 0 else "不限",
+                         ("不限（打到自然结束）" if self.max_battle_sec <= 0
+                          else "%d 分钟" % (self.max_battle_sec // 60))))
+            if self.safe_mode:
+                self._log("低风险模式：开（伤害弱化、偶尔不回血）｜回血停手：%s"
+                          % ("不限" if self.refill_cap_min <= 0
+                             else "%d 分钟后停手" % self.refill_cap_min))
             rounds_done = 0
             i = 0
             while True:
@@ -1828,6 +2222,8 @@ class GuardFishBot:
 
             self.status["state"] = "已结束" if not self._stop.is_set() else "已停止"
             self._log("运行结束（完成 %d 场）" % rounds_done)
+            if self.block_stats:
+                self._log("本次共拦截埋点上报 %d 次" % self._stats_blocked)
         except Exception as e:
             self._log("异常终止：%s" % str(e)[:300], "error")
             self._log(traceback.format_exc()[-800:], "error")
@@ -1977,6 +2373,7 @@ class GuardFishBot:
         boxes = None
         last_hud = 0
         last_claim = 0
+        next_drift_ts = time.time() + random.uniform(20, 45)
         snap_done = False
         hp_timeline = []
         hp_min = None
@@ -1990,7 +2387,7 @@ class GuardFishBot:
             self._gf_ev_idx = int(st0.get("evTotal") or 0)
         except Exception:
             self._gf_ev_idx = 0
-        while time.time() - t_battle0 < MAX_BATTLE_SECONDS:
+        while self.max_battle_sec <= 0 or (time.time() - t_battle0) < self.max_battle_sec:
             if self._stop.is_set():
                 return None
             time.sleep(jitter(TICK, -0.08, 0.12))
@@ -2075,10 +2472,19 @@ class GuardFishBot:
             self.status["refills"] = hp_refill_count
             if el - last_hud >= 60:
                 last_hud = el
-                self._log("进行中 t=%ss 第%s关 HP=%s 免费剩余=%s 回血=%d%s"
+                self._log("进行中 t=%ss 第%s关 HP=%s 免费剩余=%s 回血=%d%s%s"
                           % (el, stage.get("curStage", "?"), stage.get("curHp", "?"),
                              wm.get("freeNum", "?"), hp_refill_count,
-                             (" 秒杀=%d" % self._one_hit_kills) if self.one_hit else ""))
+                             (" 秒杀=%d" % self._one_hit_kills) if self.one_hit else "",
+                             (" 拦截埋点=%d" % self._stats_blocked) if self.block_stats else ""))
+
+            # 空闲微动：真人挂机时鼠标不会十几分钟一动不动（只移动，不点击）
+            if time.time() >= next_drift_ts:
+                next_drift_ts = time.time() + random.uniform(35, 75)
+                try:
+                    self._human_move(random.randint(220, 1280), random.randint(650, 900))
+                except Exception:
+                    pass
 
             # 3.1 结算（只有真正的结算弹窗才算本场结束；宝箱弹窗不算）
             if st.get("result") or st.get("treasure"):
@@ -2110,6 +2516,14 @@ class GuardFishBot:
             # 3.2 关卡技能三选一
             cards = st.get("skillPanel")
             if cards:
+                # 优先「一键随机选择」（点一次把所有轮次随机选完）
+                time.sleep(random.uniform(0.4, 1.2))
+                rr = self._click_random_skill()
+                if isinstance(rr, dict) and rr.get("ok"):
+                    self._log("第%s关技能三选一 → 一键随机选择" % stage.get("curStage", "?"))
+                    skills_chosen.append({"text": "一键随机选择", "score": 0, "random": True})
+                    usleep(1.8)
+                    continue
                 texts = [c.get("txt", "") for c in cards]
                 scores = [score_skill_text(t) for t in texts]
                 best = scores.index(max(scores))
@@ -2147,7 +2561,9 @@ class GuardFishBot:
         dur = time.time() - t_battle0
         if ended is None:
             ended = "超时保护"
-            self._log("达到单场最大等待时间（%d 分钟），继续下一场" % (MAX_BATTLE_SECONDS // 60), "warn")
+            if self.max_battle_sec > 0:
+                self._log("达到单场最大等待时间（%d 分钟），继续下一场"
+                          % (self.max_battle_sec // 60), "warn")
 
         # 3.5 结束清理（可能还有弹窗）
         for _ in range(4):
@@ -2524,6 +2940,18 @@ def main():
     ap.add_argument("--daily-limit", type=int, default=240,
                     help="日活跃上限分钟（0=不限，默认 240）；超限后长休 --rest-min 分钟")
     ap.add_argument("--rest-min", type=int, default=90, help="日上限后的长休分钟（默认 90）")
+    ap.add_argument("--no-block-stats", action="store_true",
+                    help="不拦截斗鱼通用埋点（默认拦截）")
+    ap.add_argument("--no-fp-harden", action="store_true",
+                    help="不注入指纹补丁（默认注入，正常环境下本身是 no-op）")
+    ap.add_argument("--no-safe", action="store_true",
+                    help="关闭低风险模式（默认开：伤害弱化/部分回血/单场<=5分钟）")
+    ap.add_argument("--safe-kill-prob", type=float, default=0.12,
+                    help="低风险模式下仍秒杀的概率（默认 0.12）")
+    ap.add_argument("--max-battle-min", type=int, default=0,
+                    help="单场最长等待分钟数（默认 0=不限，只在卡死时兜底）")
+    ap.add_argument("--refill-cap-min", type=int, default=0,
+                    help="回血多久后停手（分钟，默认 0=不限）")
     args = ap.parse_args()
 
     if args.selftest:
@@ -2549,7 +2977,13 @@ def main():
                            headless=args.headless, claim_weekpass=not args.no_claim,
                            hp_guard=not args.no_hp, hp_threshold=args.hp_threshold,
                            coin_play=not args.no_coin, one_hit=args.one_hit,
-                           daily_limit_min=args.daily_limit, rest_min=args.rest_min)
+                           daily_limit_min=args.daily_limit, rest_min=args.rest_min,
+                           block_stats=not args.no_block_stats,
+                           fp_harden=not args.no_fp_harden,
+                           safe_mode=False if args.no_safe else None,
+                           safe_kill_prob=args.safe_kill_prob,
+                           max_battle_min=args.max_battle_min,
+                           refill_cap_min=args.refill_cap_min)
         bot.add_log_sink(sink)
         bot._log("命令行挂机启动：房间=%s 场数=%d%s%s" % (args.rid, args.rounds,
                  " [headless]" if args.headless else "",
